@@ -16,6 +16,7 @@ from services.timetable_creator_service import (
     persist_plan,
 )
 from services.timetable_service import CATEGORIES
+from utils.module_context import set_active_module_id
 
 connection = get_connection()
 user_id = require_current_user().user_id
@@ -146,6 +147,7 @@ if action_columns[2].button("Create timetable", type="primary", icon=":material/
         updated_plan = apply_request_constraints(
             parse_plan(json.dumps(raw_plan)),
             st.session_state.get("ai_timetable_submitted_request", ""),
+            preserve_random_times=True,
         )
         module_id = st.session_state.get("ai_timetable_module_id")
         conflicts = detect_conflicts(connection, user_id, updated_plan, module_id)
@@ -155,7 +157,12 @@ if action_columns[2].button("Create timetable", type="primary", icon=":material/
     except (ValueError, AIProviderError) as error:
         st.error(str(error))
     else:
-        st.session_state.active_module_id = saved_module_id
+        set_active_module_id(
+            st.session_state,
+            user_id,
+            saved_module_id,
+            get_modules(connection, user_id),
+        )
         st.session_state.ai_timetable_plan = None
         st.success("Timetable created. Your sessions are now available in Timetable.")
         st.switch_page("pages/timetable.py")

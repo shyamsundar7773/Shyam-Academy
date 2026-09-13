@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 import streamlit as st
 from auth.session import require_current_user
 
@@ -10,6 +8,12 @@ from services.timetable_service import CATEGORIES
 from utils.formatting import display_date
 from services.schedule_status import session_status
 from alarms.repository import get_alarm_for_session
+from utils.timetable_presentation import group_sessions_by_date
+from utils.module_context import (
+    clear_active_module_id,
+    get_active_module_id,
+    set_active_module_id,
+)
 
 connection = get_connection()
 user_id = require_current_user().user_id
@@ -36,15 +40,19 @@ modules = get_modules(connection, user_id)
 if not modules:
     st.info("No modules yet. Create a timetable with AI to get started.")
     st.stop()
-module_names = [module["module_name"] for module in modules]
+active_module_id = get_active_module_id(st.session_state, user_id, modules)
+active_index = next(
+    index for index, module in enumerate(modules)
+    if module["module_id"] == active_module_id
+)
 selected_name = st.selectbox(
     "Module",
-    module_names,
-    index=module_names.index(st.session_state.get("active_module_name", module_names[0]))
-    if st.session_state.get("active_module_name") in module_names else 0,
+    modules,
+    index=active_index,
+    format_func=lambda module: module["module_name"],
 )
-selected_module = next(module for module in modules if module["module_name"] == selected_name)
-st.session_state.active_module_id = selected_module["module_id"]
+selected_module = selected_name
+set_active_module_id(st.session_state, user_id, selected_module["module_id"], modules)
 st.session_state.active_module_name = selected_module["module_name"]
 
 rename_requested = st.button("Rename", key=f"rename_module_{selected_module['module_id']}")
@@ -77,21 +85,19 @@ if st.button("Delete module", type="secondary", icon=":material/delete:"):
     except ValueError as error:
         st.error(str(error))
     else:
-        st.session_state.pop("active_module_id", None)
+        clear_active_module_id(st.session_state, user_id)
         st.session_state.pop("active_module_name", None)
         st.success("Module and its timetable were deleted.")
         st.rerun()
 sessions = get_timetable(connection, selected_module["module_id"], user_id)
 categories = list(CATEGORIES)
-grouped = defaultdict(list)
-for session in sessions:
-    grouped[(session["day_number"], session["session_date"])].append(session)
+grouped = group_sessions_by_date(sessions, categories)
 
 st.subheader(selected_module["module_name"])
 if not grouped:
     st.info("No sessions are scheduled for this module yet.")
 
-for (day_number, session_date), day_sessions in grouped.items():
+for day_number, session_date, day_sessions in grouped:
     with st.container(border=True):
         st.markdown(f"### Day {day_number}")
         st.caption(f"Date: {display_date(session_date)}")

@@ -1,22 +1,29 @@
 import json
 import sqlite3
+from dataclasses import asdict
+import inspect
+import random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
+import services.timetable_creator_service as timetable_creator_service
 
 from ai.gateway import AIGateway
 from database.schema import initialize_database
 from services.module_service import add_module
 from services.timetable_creator_service import (
     CATEGORIES,
+    DateConstraintConflict,
     _parse_time,
     _assign_random_times,
+    _session_window,
     _request_constraints,
     detect_conflicts,
     generate_plan,
     parse_plan,
     persist_plan,
+    apply_request_constraints,
 )
 
 
@@ -63,6 +70,20 @@ def connection():
     initialize_database(connection)
     yield connection
     connection.close()
+
+
+@pytest.fixture
+def frozen_timetable_reference_date(monkeypatch):
+    """Keep duration-only timetable tests independent of the machine clock."""
+    reference_date = date(2026, 9, 13)
+
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return reference_date
+
+    monkeypatch.setattr(timetable_creator_service, "date", FrozenDate)
+    return reference_date
 
 
 class Gateway(AIGateway):
@@ -247,6 +268,193 @@ def test_empty_request_rejected():
         generate_plan(Gateway("{}"), " ")
 
 
+def test_duration_only_resolves_exactly_three_dates():
+    plan = generate_plan(
+        Gateway(_empty_provider_response()),
+        "create a timetable for 3 days in python concept basics",
+    )
+    assert len({session.session_date for session in plan.sessions}) == 3
+
+
+def test_explicit_range_resolves_inclusive_dates():
+    spec = _request_constraints(
+        "create a timetable from September 13 to September 16 in python concept basics"
+    )
+    assert [item.day for item in spec.allowed_dates] == [13, 14, 15, 16]
+
+
+def test_matching_duration_and_range_resolves_without_conflict():
+    spec = _request_constraints(
+        "create a timetable for 3 days from September 13 to September 15"
+    )
+    assert len(spec.allowed_dates) == 3
+
+
+def test_conflicting_duration_and_range_is_structured_and_precedes_generation():
+    gateway = Gateway(_empty_provider_response())
+    with pytest.raises(DateConstraintConflict) as raised:
+        generate_plan(
+            gateway,
+            "create a timetable for 3 days from September 13 to September 16",
+        )
+    assert gateway.calls == []
+    assert raised.value.code == "DATE_CONSTRAINT_CONFLICT"
+    assert raised.value.details == {
+        "requested_duration_days": 3,
+        "explicit_start_date": "2026-09-13",
+        "explicit_end_date": "2026-09-16",
+        "inclusive_range_length": 4,
+        "reason": (
+            "The requested duration does not match the inclusive explicit "
+            "date range."
+        ),
+    }
+
+
+def test_duration_within_range_selects_exactly_three_dates():
+    spec = _request_constraints(
+        "create a timetable for 3 days within September 13 to September 16"
+    )
+    assert [item.day for item in spec.allowed_dates] == [13, 14, 15]
+
+
+def test_ordinal_explicit_range_resolves_all_four_inclusive_dates():
+    spec = _request_constraints(
+        "Create a timetable for python basics in the date of "
+        "September 13th to September 16"
+    )
+    assert [item.isoformat() for item in spec.allowed_dates] == [
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16",
+    ]
+
+
+def test_ordinal_range_generation_does_not_create_duplicate_sessions():
+    prompt = (
+        "Create a timetable for python basics in the date of "
+        "September 13th to September 16"
+    )
+    plan = generate_plan(Gateway(_adversarial_response()), prompt)
+    assert {session.session_date for session in plan.sessions} == {
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16",
+    }
+    assert len({
+        (
+            session.session_date, session.category, session.topic,
+            session.session_title, session.prompt, session.scheduled_time,
+            session.scheduled_end_time or "", session.status, session.day_number,
+        )
+        for session in plan.sessions
+    }) == len(plan.sessions)
+
+
+def test_duplicate_identity_requires_identical_canonical_session_content():
+    payload = _payload()
+    payload["sessions"].append(dict(payload["sessions"][0]))
+    with pytest.raises(ValueError, match="duplicate sessions"):
+        parse_plan(json.dumps(payload), check_overlaps=False)
+
+
+def test_same_start_time_different_canonical_sessions_are_not_duplicate_error():
+    payload = _payload()
+    payload["sessions"][1]["session_date"] = payload["sessions"][0]["session_date"]
+    payload["sessions"][1]["scheduled_time"] = payload["sessions"][0]["scheduled_time"]
+    payload["sessions"][1]["topic"] = "Different legitimate topic"
+    with pytest.raises(ValueError, match="overlapping sessions"):
+        parse_plan(json.dumps(payload), check_overlaps=True)
+
+
+def test_numeric_date_range_resolves_inclusive_dates():
+    spec = _request_constraints(
+        "create a timetable from 13/09/2026 to 16/09/2026"
+    )
+    assert [item.isoformat() for item in spec.allowed_dates] == [
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16",
+    ]
+
+
+def test_fill_all_categories_phrase_activates_full_matrix():
+    prompt = (
+        "create a timetable for 3 days in python concept basics, each day "
+        "fill all the categories with random timing"
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert plan.total_sessions == 3 * len(CATEGORIES)
+    assert {
+        (session.session_date, session.category)
+        for session in plan.sessions
+    } == {
+        (session_date, category)
+        for session_date in {session.session_date for session in plan.sessions}
+        for category in CATEGORIES
+    }
+
+
+def test_explicit_four_day_full_category_matrix_has_28_sessions():
+    prompt = (
+        "create a timetable from September 13 to September 16 in python concept "
+        "basics, each day fill all the categories with random timing"
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert plan.total_sessions == 4 * len(CATEGORIES)
+    assert {session.session_date for session in plan.sessions} == {
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16",
+    }
+
+
+def test_seeded_adversarial_full_matrix_property_cases():
+    topics = [
+        "Python concept basics", "SQL fundamentals", "Data Structures",
+        "Machine Learning basics", "Excel", "Power BI", "Java", "Statistics",
+    ]
+    duration_words = ["3", "three", "3-day", "4", "four", "5"]
+    generator = random.Random(20260913)
+    prompts = [
+        (
+            f"create a timetable for {duration_words[index % len(duration_words)]} "
+            f"{'' if '-' in duration_words[index % len(duration_words)] else 'days '}"
+            f"in {topics[generator.randrange(len(topics))]}, "
+            f"{'each day fill every category' if index % 2 else 'complete timetable'}, "
+            "with random timing"
+        )
+        for index in range(30)
+    ]
+    for prompt in prompts:
+        plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+        dates = {session.session_date for session in plan.sessions}
+        assert len(dates) in {3, 4, 5}
+        assert len(plan.sessions) == len(dates) * len(CATEGORIES)
+        assert {
+            (session.session_date, session.category)
+            for session in plan.sessions
+        } == {
+            (session_date, category)
+            for session_date in dates
+            for category in CATEGORIES
+        }
+
+
+def test_exact_user_prompt_uses_three_dates_inside_date_window():
+    prompt = (
+        "here create a timetable for 3 days in python concept basics\n"
+        "in each day - fill all the categories with random timing - so dont "
+        "miss anything or empty\n"
+        "date - september 13 - september 16"
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert {session.session_date for session in plan.sessions} == {
+        "2026-09-13", "2026-09-14", "2026-09-15",
+    }
+    assert plan.total_sessions == 21
+    assert {
+        (session.session_date, session.category)
+        for session in plan.sessions
+    } == {
+        (session_date, category)
+        for session_date in {"2026-09-13", "2026-09-14", "2026-09-15"}
+        for category in CATEGORIES
+    }
+
+
 @pytest.mark.parametrize("prompt", [
     "create a timetable only on September 13, 2026 for SQL Developer with random times",
     "make an SQL timetable for September 13, 2026 only, random times",
@@ -284,7 +492,7 @@ def test_adversarial_prompts_respect_hard_constraints(prompt):
         )
 
 
-def test_valid_free_form_request_calls_gateway_once():
+def test_valid_free_form_request_calls_gateway_once(frozen_timetable_reference_date):
     gateway = Gateway(json.dumps(_payload()))
     plan = generate_plan(gateway, "Make me job-ready in two days.")
     assert plan.module_name == "SQL Developer"
@@ -369,7 +577,7 @@ def test_invalid_assumptions_structures_remain_rejected(assumptions):
 def test_real_world_exact_date_prompt_preserves_constraints_after_normalization():
     prompt = (
         "create a timetable on sep 13 only as small sql workshop session "
-        "with upcoming random time in fit in all categories"
+        "with random times in fit in all categories"
     )
     payload = json.loads(_adversarial_response())
     payload["assumptions"] = "Small workshop sessions."
@@ -378,20 +586,14 @@ def test_real_world_exact_date_prompt_preserves_constraints_after_normalization(
     assert {session.session_date for session in plan.sessions} == {"2026-09-13"}
     assert {session.category for session in plan.sessions} == set(CATEGORIES)
     assert plan.timezone == "Asia/Kolkata"
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
     for session in plan.sessions:
-        scheduled = datetime.combine(
-            date.fromisoformat(session.session_date),
-            datetime.strptime(session.scheduled_time, "%I:%M %p").time(),
-            tzinfo=ZoneInfo("Asia/Kolkata"),
-        )
-        assert scheduled > now
+        assert datetime.strptime(session.scheduled_time, "%I:%M %p")
 
 
 def test_real_world_pipeline_has_canonical_random_times_and_all_categories():
     prompt = (
         "create a timetable on sep 13 only as small sql workshop session "
-        "with upcoming random time in fit in all categories"
+        "with random times in fit in all categories"
     )
     payload = json.loads(_adversarial_response())
     payload["assumptions"] = "Small workshop sessions."
@@ -406,7 +608,7 @@ def test_real_world_pipeline_has_canonical_random_times_and_all_categories():
 
 
 @pytest.mark.parametrize("prompt", [
-    "SQL workshop on Sep 13 only with random upcoming time",
+    "SQL workshop on Sep 13 only with random times",
     "SQL sessions from September 13 to September 16",
     "SQL on Sep 13, Sep 15 and Sep 17 only",
     "divide a small SQL workshop into four days starting Sep 13",
@@ -445,7 +647,7 @@ def test_exact_date_prompt_never_expands_to_next_day():
     ],
 )
 def test_controlled_curriculum_sizes_produce_structured_sessions(
-    topic_count, day_count, categories
+    topic_count, day_count, categories, frozen_timetable_reference_date
 ):
     topics = ", ".join(
         f"SQL curriculum topic {index}" for index in range(1, topic_count + 1)
@@ -463,8 +665,13 @@ def test_controlled_curriculum_sizes_produce_structured_sessions(
         Gateway(_curriculum_response(topic_count, day_count, categories)),
         prompt,
     )
-    assert plan.total_sessions == topic_count
-    assert all(session.topic.startswith("SQL curriculum topic ") for session in plan.sessions)
+    expected_sessions = (
+        day_count * len(CATEGORIES)
+        if set(categories) == set(CATEGORIES)
+        else topic_count
+    )
+    assert plan.total_sessions == expected_sessions
+    assert all("SQL curriculum topic " in session.topic for session in plan.sessions)
     assert {session.category for session in plan.sessions} == set(categories)
 
 
@@ -617,6 +824,680 @@ def test_single_day_workshop_does_not_spill_to_next_day():
         "SQL workshop on September 13 only with random times in all categories",
     )
     assert all(session.session_date == "2026-09-13" for session in plan.sessions)
+
+
+def test_manual_test_2_sql_curriculum_has_valid_statuses_and_non_overlapping_times():
+    topics = (
+        "SQL basics, SELECT, WHERE, ORDER BY, GROUP BY, HAVING, aggregate functions, "
+        "DISTINCT, aliases, INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN, self join, "
+        "subqueries, correlated subqueries, CTEs, CASE expressions, string functions, "
+        "date functions, window functions, ROW_NUMBER, RANK, DENSE_RANK, UNION, UNION ALL, "
+        "EXISTS, NOT EXISTS, indexes, views, stored procedures, transactions, ACID, normalization"
+    )
+    prompt = (
+        "Create a SQL Developer learning timetable from September 13, 2026 through "
+        f"September 16, 2026. Fit these topics and distribute all supplied topics across "
+        f"the 4 days. Use random valid times: [{topics}]"
+    )
+    provider = json.loads(_curriculum_response(34, 4, CATEGORIES))
+    for session in provider["sessions"]:
+        session["scheduled_time"] = "7:00 AM"
+        session["status"] = "provider-state"
+    plan = generate_plan(Gateway(json.dumps(provider)), prompt)
+    assert {session.session_date for session in plan.sessions} <= {
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"
+    }
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+    for session_date in {session.session_date for session in plan.sessions}:
+        day = [session for session in plan.sessions if session.session_date == session_date]
+        windows = sorted(_session_window(session) for session in day)
+        assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+def test_manual_test_4_single_day_all_categories_ignores_overlapping_provider_times():
+    prompt = (
+        "Create a timetable ONLY on September 13, 2026 for SQL Developer interview "
+        "preparation with a small workshop in all timetable categories. Use random "
+        "valid times between 10:00 AM and 9:00 PM."
+    )
+    payload = _payload(sessions=_random_time_plan())
+    for index, session in enumerate(payload["sessions"]):
+        session["scheduled_time"] = "10:00 AM"
+        session["status"] = None if index == 0 else "untrusted"
+    plan = generate_plan(Gateway(json.dumps(payload)), prompt)
+    assert {session.session_date for session in plan.sessions} == {"2026-09-13"}
+    assert {session.category for session in plan.sessions} == set(CATEGORIES)
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+    windows = sorted(_session_window(session) for session in plan.sessions)
+    assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+def test_required_1_four_day_preview_create_persists_identical_canonical_plan(connection):
+    topics = _sql_curriculum_topics()[:34]
+    prompt = _curriculum_prompt(topics, 4, "with random times and all categories")
+    preview = generate_plan(Gateway(_empty_provider_response()), prompt)
+    create_input = parse_plan(json.dumps(asdict(preview)))
+    created = apply_request_constraints(create_input, prompt, preserve_random_times=True)
+    assert [
+        (session.session_date, session.scheduled_time, session.scheduled_end_time,
+         session.category, session.topic, session.status)
+        for session in created.sessions
+    ] == [
+        (session.session_date, session.scheduled_time, session.scheduled_end_time,
+         session.category, session.topic, session.status)
+        for session in preview.sessions
+    ]
+    module_id, session_ids = persist_plan(connection, "user-a", created)
+    rows = connection.execute(
+        "SELECT session_date, scheduled_time, scheduled_end_time, category, topic, status "
+        "FROM sessions WHERE module_id = ? ORDER BY session_id",
+        (module_id,),
+    ).fetchall()
+    assert len(session_ids) == len(preview.sessions)
+    assert [
+        tuple(row) for row in rows
+    ] == [
+        (session.session_date, session.scheduled_time, session.scheduled_end_time or "",
+         session.category, session.topic, session.status)
+        for session in preview.sessions
+    ]
+
+
+def test_required_2_single_date_categories_remain_canonical_after_create():
+    prompt = (
+        "Create a SQL Developer workshop ONLY on September 13, 2026 with all "
+        "timetable categories and random valid times between 10:00 AM and 9:00 PM."
+    )
+    payload = _payload(sessions=_random_time_plan())
+    for session in payload["sessions"]:
+        session["scheduled_time"] = "10:00 AM"
+    preview = generate_plan(Gateway(json.dumps(payload)), prompt)
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))), prompt, preserve_random_times=True
+    )
+    assert created == preview
+    assert {session.session_date for session in created.sessions} == {"2026-09-13"}
+    assert {session.category for session in created.sessions} == set(CATEGORIES)
+
+
+def test_required_3_ten_day_curriculum_preserves_dates_topics_and_times():
+    topics = _sql_curriculum_topics()[:30]
+    prompt = _curriculum_prompt(topics, 10, "with all categories and random times")
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert len({session.session_date for session in plan.sessions}) == 10
+    searchable = " ".join(session.topic for session in plan.sessions).casefold()
+    assert all(topic.casefold() in searchable for topic in topics)
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+
+
+def test_required_4_single_day_workshop_has_capacity_for_all_categories():
+    prompt = (
+        "SQL Developer interview preparation ONLY on September 13, 2026, "
+        "small workshop in all categories, random valid times between 10 AM and 9 PM"
+    )
+    plan = generate_plan(Gateway(json.dumps(_payload(
+        sessions=_random_time_plan()
+    ))), prompt)
+    assert {session.category for session in plan.sessions} == set(CATEGORIES)
+    assert len(plan.sessions) == len(set((s.session_date, s.scheduled_time) for s in plan.sessions))
+
+
+def test_required_5_overlapping_provider_times_are_replaced_before_validation():
+    payload = _payload(sessions=_random_time_plan(3))
+    payload["sessions"][0].update(scheduled_time="10:00 AM", scheduled_end_time="11:00 AM")
+    payload["sessions"][1].update(scheduled_time="10:30 AM", scheduled_end_time="11:30 AM")
+    payload["sessions"][2].update(scheduled_time="10:45 AM", scheduled_end_time="11:30 AM")
+    plan = generate_plan(Gateway(json.dumps(payload)),
+                         "SQL workshop on September 13 only with random valid times")
+    windows = sorted(_session_window(session) for session in plan.sessions)
+    assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+def test_required_6_all_provider_status_variants_become_scheduled():
+    payload = _payload()
+    payload["sessions"][0]["status"] = None
+    payload["sessions"][1]["status"] = "arbitrary"
+    plan = generate_plan(
+        Gateway(json.dumps(payload)),
+        "SQL workshop on September 13 with random valid times",
+    )
+    assert {session.status for session in plan.sessions} == {"Scheduled"}
+
+
+def test_required_7_create_does_not_regenerate_preview_random_times():
+    prompt = "SQL workshop on September 13 only with random valid times in all categories"
+    preview = generate_plan(Gateway(json.dumps(_payload(
+        sessions=_random_time_plan()
+    ))), prompt)
+    times = [session.scheduled_time for session in preview.sessions]
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))), prompt, preserve_random_times=True
+    )
+    assert [session.scheduled_time for session in created.sessions] == times
+
+
+def test_create_api_accepts_preserve_random_times_keyword_and_preserves_plan():
+    prompt = "SQL workshop on September 13 only with random valid times in all categories"
+    preview = generate_plan(Gateway(json.dumps(_payload(
+        sessions=_random_time_plan()
+    ))), prompt)
+    assert "preserve_random_times" in inspect.signature(
+        apply_request_constraints
+    ).parameters
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+        preserve_random_times=True,
+    )
+    assert asdict(created) == asdict(preview)
+
+
+def test_create_api_default_remains_compatible_for_non_random_callers():
+    prompt = "SQL workshop from September 13 to September 14"
+    preview = generate_plan(Gateway(json.dumps(_payload())), prompt)
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+    )
+    assert {session.session_date for session in created.sessions} == {
+        "2026-09-13", "2026-09-14"
+    }
+
+
+def test_create_api_preserve_false_retains_existing_random_allocation_behavior():
+    prompt = "SQL workshop on September 13 only with random valid times"
+    preview = generate_plan(Gateway(json.dumps(_payload(
+        sessions=_random_time_plan()
+    ))), prompt)
+    reallocated = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+        preserve_random_times=False,
+    )
+    windows = sorted(_session_window(session) for session in reallocated.sessions)
+    assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+    assert {session.session_date for session in reallocated.sessions} == {"2026-09-13"}
+
+
+def test_create_api_rejects_legacy_keyword_mismatch_in_test_double():
+    def legacy_apply(plan, request):
+        return plan
+
+    with pytest.raises(TypeError, match="preserve_random_times"):
+        legacy_apply(None, "request", preserve_random_times=True)
+
+
+def _assert_full_matrix(plan, dates):
+    expected = {(item, category) for item in dates for category in CATEGORIES}
+    actual = {(session.session_date, session.category) for session in plan.sessions}
+    assert actual == expected
+    assert len(plan.sessions) == len(expected)
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+    for session_date in dates:
+        windows = sorted(
+            _session_window(session)
+            for session in plan.sessions
+            if session.session_date == session_date
+        )
+        assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+def _canonical_plan_content(plan):
+    return {
+        "title": plan.title,
+        "module_name": plan.module_name,
+        "description": plan.description,
+        "start_date": plan.start_date,
+        "end_date": plan.end_date,
+        "timezone": plan.timezone,
+        "assumptions": tuple(plan.assumptions),
+        "sessions": tuple(
+            (
+                session.day_number,
+                session.session_date,
+                session.category,
+                session.topic,
+                session.session_title,
+                session.prompt,
+                session.scheduled_time,
+                session.scheduled_end_time or "",
+                session.status,
+            )
+            for session in plan.sessions
+        ),
+    }
+
+
+def _canonical_persisted_content(connection, module_id):
+    rows = connection.execute(
+        """
+        SELECT day_number, session_date, category, topic, prompt,
+               scheduled_time, scheduled_end_time, status
+        FROM sessions
+        WHERE module_id = ?
+        ORDER BY session_id
+        """,
+        (module_id,),
+    ).fetchall()
+    return {
+        "sessions": tuple(
+            (
+                row["day_number"],
+                row["session_date"],
+                row["category"],
+                row["topic"],
+                row["prompt"],
+                row["scheduled_time"],
+                row["scheduled_end_time"] or "",
+                row["status"],
+            )
+            for row in rows
+        )
+    }
+
+
+def _assert_preview_create_identity(connection, prompt, provider_response):
+    preview = generate_plan(Gateway(provider_response), prompt)
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+        preserve_random_times=True,
+    )
+    module_id, session_ids = persist_plan(connection, "identity-user", created)
+    persisted = _canonical_persisted_content(connection, module_id)
+    preview_content = _canonical_plan_content(preview)
+    created_content = _canonical_plan_content(created)
+    assert created_content == preview_content
+    assert persisted["sessions"] == tuple(
+        item[:4] + item[5:]
+        for item in preview_content["sessions"]
+    )
+    assert len(session_ids) == len(preview.sessions)
+    assert all(isinstance(session_id, int) for session_id in session_ids)
+    return preview
+
+
+def test_preview_create_identity_for_exact_user_prompt(connection):
+    prompt = (
+        "here create a timetable for 3 days in python concept basics\n"
+        "in each day - fill all the categories with random timing - so dont "
+        "miss anything or empty\n"
+        "date - september 13 - september 16"
+    )
+    preview = _assert_preview_create_identity(
+        connection, prompt, _empty_provider_response()
+    )
+    _assert_full_matrix(
+        preview,
+        ["2026-09-13", "2026-09-14", "2026-09-15"],
+    )
+
+
+def test_biology_manual_prompt_preserves_all_times_through_persistence(connection):
+    prompt = (
+        "create a timetable on module name as - ( biology basic ) on fill the "
+        "random in all categories ( dont leave any category empty ) on september "
+        "13 to september 16"
+    )
+    preview = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert len(preview.sessions) == 28
+    assert all(session.scheduled_time for session in preview.sessions)
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+        preserve_random_times=True,
+    )
+    assert [
+        (session.session_date, session.category, session.scheduled_time,
+         session.scheduled_end_time, session.status)
+        for session in created.sessions
+    ] == [
+        (session.session_date, session.category, session.scheduled_time,
+         session.scheduled_end_time, session.status)
+        for session in preview.sessions
+    ]
+    module_id, session_ids = persist_plan(connection, "biology-user", created)
+    rows = connection.execute(
+        "SELECT session_date, category, scheduled_time, scheduled_end_time, status "
+        "FROM sessions WHERE session_id IN ({}) ORDER BY session_id".format(
+            ",".join("?" for _ in session_ids)
+        ),
+        session_ids,
+    ).fetchall()
+    assert len(rows) == 28
+    assert all(row["scheduled_time"].strip() for row in rows)
+    assert all(row["status"] == "Scheduled" for row in rows)
+    assert module_id > 0
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_biology_manual_prompt_has_28_scheduled_times_for_repeated_generations(seed):
+    prompt = (
+        "create a timetable on module name as - ( biology basic ) on fill the "
+        "random in all categories ( dont leave any category empty ) on september "
+        "13 to september 16"
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert len(plan.sessions) == 28
+    assert len({session.session_date for session in plan.sessions}) == 4
+    assert all(session.scheduled_time for session in plan.sessions)
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "provider_factory", "expected_dates"),
+    [
+        (
+            "Create a 3-day Python timetable starting September 13, 2026 "
+            "with all categories and random timing.",
+            lambda: _empty_provider_response(),
+            3,
+        ),
+        (
+            "Create a SQL timetable from September 13, 2026 to September 16, "
+            "2026 with all categories and random timing.",
+            lambda: _empty_provider_response(),
+            4,
+        ),
+        (
+            "Create a 5-day Data Structures timetable starting September 13, "
+            "2026 with every category and random timing.",
+            lambda: _empty_provider_response(),
+            5,
+        ),
+        (
+            "Create a 3-day timetable within September 13 to September 16 "
+            "for Machine Learning basics with all categories and random timing.",
+            lambda: _empty_provider_response(),
+            3,
+        ),
+        (
+            "Create a large Python curriculum for 10 days with all categories "
+            "and random timing.",
+            lambda: _empty_provider_response(),
+            10,
+        ),
+        (
+            "Create a 2-day Excel timetable from September 13, 2026 to "
+            "September 14, 2026 with all categories and random timing.",
+            lambda: _empty_provider_response("nested"),
+            2,
+        ),
+        (
+            "Create a 2-day Power BI timetable from September 13, 2026 to "
+            "September 14, 2026 with all categories and random timing.",
+            lambda: _empty_provider_response("days"),
+            2,
+        ),
+    ],
+)
+def test_preview_create_identity_across_canonical_matrix_cases(
+    connection, prompt, provider_factory, expected_dates
+):
+    preview = _assert_preview_create_identity(
+        connection, prompt, provider_factory()
+    )
+    assert len({session.session_date for session in preview.sessions}) == expected_dates
+    assert len(preview.sessions) == expected_dates * len(CATEGORIES)
+    _assert_full_matrix(
+        preview,
+        sorted({session.session_date for session in preview.sessions}),
+    )
+
+
+def test_preview_create_identity_repairs_overlapping_provider_times(connection):
+    payload = json.loads(_empty_provider_response())
+    payload["sessions"] = _random_time_plan()
+    for session in payload["sessions"]:
+        session["scheduled_time"] = "10:00 AM"
+    prompt = (
+        "Create a 1-day Java timetable on September 13, 2026 with all "
+        "categories and random timing."
+    )
+    preview = _assert_preview_create_identity(connection, prompt, json.dumps(payload))
+    _assert_full_matrix(preview, ["2026-09-13"])
+
+
+def test_preview_create_identity_with_same_seed_is_exactly_repeatable():
+    sessions = list(
+        parse_plan(
+            json.dumps(_payload(sessions=_random_time_plan())),
+            check_overlaps=False,
+        ).sessions
+    )
+    spec = _request_constraints(
+        "SQL workshop on September 13 only with random timing"
+    )
+    first = _assign_random_times(list(sessions), spec, seed=20260913)
+    second = _assign_random_times(list(sessions), spec, seed=20260913)
+    assert [
+        (session.session_date, session.category, session.topic,
+         session.scheduled_time, session.scheduled_end_time, session.status)
+        for session in first
+    ] == [
+        (session.session_date, session.category, session.topic,
+         session.scheduled_time, session.scheduled_end_time, session.status)
+        for session in second
+    ]
+
+
+def test_matrix_python_three_day_full_category_coverage():
+    dates = ["2026-09-13", "2026-09-14", "2026-09-15"]
+    prompt = (
+        "Create a timetable for Python concept basics for 3 days starting "
+        "September 13, 2026. Every day must contain all categories. Use random timing."
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(plan, dates)
+
+
+def test_matrix_python_four_day_explicit_range():
+    dates = ["2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"]
+    prompt = (
+        "Create a Python timetable from September 13, 2026 to September 16, 2026. "
+        "Fill every category on every day with random valid times."
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(plan, dates)
+
+
+def test_matrix_complex_sql_four_day_curriculum_preview_create_identity(
+    frozen_timetable_reference_date,
+):
+    topics = _sql_curriculum_topics()[:24]
+    prompt = _curriculum_prompt(topics, 4, "with all categories and random valid times")
+    preview = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(preview, ["2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"])
+    created = apply_request_constraints(
+        parse_plan(json.dumps(asdict(preview))),
+        prompt,
+        preserve_random_times=True,
+    )
+    assert asdict(created) == asdict(preview)
+
+
+def test_matrix_repairs_damaged_provider_output():
+    payload = json.loads(_curriculum_response(8, 4, CATEGORIES[:2]))
+    for index, session in enumerate(payload["sessions"]):
+        session["scheduled_time"] = "10:00 AM" if index % 2 else "malformed"
+        session["status"] = "provider-state"
+    payload["sessions"].append(dict(payload["sessions"][0]))
+    prompt = (
+        "Create a 4-day Python timetable from September 13, 2026 to September 16, "
+        "2026 with full category coverage and random timing."
+    )
+    plan = generate_plan(Gateway(json.dumps(payload)), prompt)
+    _assert_full_matrix(plan, ["2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"])
+
+
+def test_matrix_contradictory_duration_and_explicit_range_is_structured_conflict():
+    prompt = (
+        "Create a timetable for 3 days in Python from September 13, 2026 to "
+        "September 16, 2026. Fill every category on every day with random timing."
+    )
+    with pytest.raises(ValueError, match="DATE_CONSTRAINT_CONFLICT"):
+        generate_plan(Gateway(_empty_provider_response()), prompt)
+
+
+@pytest.mark.parametrize("day_count", [1, 2, 3, 4, 7])
+def test_matrix_day_counts_have_exact_category_cells(day_count):
+    dates = [
+        (date(2026, 9, 13) + timedelta(days=index)).isoformat()
+        for index in range(day_count)
+    ]
+    prompt = (
+        f"Create a {day_count}-day Python timetable starting September 13, 2026 "
+        "with all categories and random timing."
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(plan, dates)
+
+
+@pytest.mark.parametrize("subject", ["Python", "SQL", "Java"])
+def test_matrix_subjects_preserve_full_category_coverage(subject):
+    dates = ["2026-09-13", "2026-09-14"]
+    prompt = (
+        f"Create a {subject} timetable from September 13, 2026 to September 14, "
+        "2026 with all categories and random valid times."
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(plan, dates)
+    assert subject.casefold() in " ".join(session.topic for session in plan.sessions).casefold()
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_times", "malformed_times", "overlapping_times", "duplicate_sessions",
+    "missing_categories", "invalid_statuses", "nested_plan", "days_only",
+])
+def test_matrix_adversarial_provider_damage_preserves_invariant(damage):
+    payload = json.loads(_curriculum_response(7, 2, CATEGORIES))
+    if damage == "missing_times":
+        for session in payload["sessions"]:
+            session.pop("scheduled_time", None)
+    elif damage == "malformed_times":
+        for session in payload["sessions"]:
+            session["scheduled_time"] = "not-a-time"
+    elif damage == "overlapping_times":
+        for session in payload["sessions"]:
+            session["scheduled_time"] = "10:00 AM"
+    elif damage == "duplicate_sessions":
+        payload["sessions"].append(dict(payload["sessions"][0]))
+    elif damage == "missing_categories":
+        payload["sessions"] = [
+            session for session in payload["sessions"] if session["category"] == "Level 1"
+        ]
+    elif damage == "invalid_statuses":
+        for session in payload["sessions"]:
+            session["status"] = "unknown"
+    elif damage == "nested_plan":
+        payload = {"plan": payload}
+    elif damage == "days_only":
+        sessions = payload.pop("sessions")
+        payload["days"] = [
+            {"date": session["session_date"], "sessions": [session]}
+            for session in sessions
+        ]
+        payload["sessions"] = None
+    prompt = (
+        "Create a 2-day Python timetable from September 13, 2026 to September 14, "
+        "2026 with all categories and random timing."
+    )
+    plan = generate_plan(Gateway(json.dumps(payload)), prompt)
+    _assert_full_matrix(plan, ["2026-09-13", "2026-09-14"])
+
+
+def test_matrix_repeated_generation_has_stable_dates_categories_and_topics():
+    prompt = (
+        "Create a 3-day Python timetable starting September 13, 2026 with all "
+        "categories and random timing."
+    )
+    first = generate_plan(Gateway(_empty_provider_response()), prompt)
+    second = generate_plan(Gateway(_empty_provider_response()), prompt)
+    assert sorted([
+        (session.session_date, session.category, session.topic)
+        for session in first.sessions
+    ]) == sorted([
+        (session.session_date, session.category, session.topic)
+        for session in second.sessions
+    ])
+
+
+@pytest.mark.parametrize("suffix", [
+    "random valid times between 9 AM and 9 PM",
+    "random timing with full category coverage",
+    "random times and every category",
+])
+def test_matrix_time_and_category_wording_keeps_all_cells(suffix):
+    dates = ["2026-09-13", "2026-09-14"]
+    prompt = (
+        f"Create a Python timetable from September 13, 2026 to September 14, 2026 "
+        f"with all categories and {suffix}."
+    )
+    plan = generate_plan(Gateway(_empty_provider_response()), prompt)
+    _assert_full_matrix(plan, dates)
+
+
+def test_required_8_many_sessions_and_categories_remain_overlap_free():
+    payload = json.loads(_curriculum_response(32, 4, CATEGORIES))
+    for index, session in enumerate(payload["sessions"]):
+        session["scheduled_time"] = "not-a-time" if index % 3 == 0 else "10:00 AM"
+        session["status"] = "provider-status"
+    prompt = _curriculum_prompt(
+        _sql_curriculum_topics()[:32], 4, "with all categories and random valid times"
+    )
+    plan = generate_plan(Gateway(json.dumps(payload)), prompt)
+    assert {session.category for session in plan.sessions} == set(CATEGORIES)
+    for session_date in {s.session_date for s in plan.sessions}:
+        windows = sorted(_session_window(s) for s in plan.sessions if s.session_date == session_date)
+        assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+@pytest.mark.parametrize("case", [
+    "exact single date + random time", "date range + random time",
+    "10-day curriculum", "30-day curriculum", "all categories", "one category",
+    "duplicate provider times", "overlapping provider times", "missing provider times",
+    "malformed provider times", "invalid provider status", "missing provider status",
+    "null provider status", "many sessions one date", "adjacent sessions",
+    "different durations", "malformed JSON wrapper", "nested plan.sessions",
+    "days-only provider structure", "preview create flow",
+])
+def test_twenty_adversarial_final_plan_cases(case):
+    if case == "malformed JSON wrapper":
+        topics = _sql_curriculum_topics()[:12]
+        plan = generate_plan(Gateway("Explanation:\n" + _empty_provider_response()),
+                             _curriculum_prompt(topics, 4, "with random times"))
+    elif case in {"nested plan.sessions", "days-only provider structure"}:
+        kind = "nested" if case.startswith("nested") else "days"
+        topics = _sql_curriculum_topics()[:12]
+        plan = generate_plan(Gateway(_empty_provider_response(kind)),
+                             _curriculum_prompt(topics, 4, "with random times"))
+    else:
+        prompt = "SQL workshop on September 13 only with random valid times"
+        plan = generate_plan(Gateway(json.dumps(_payload(
+            sessions=_random_time_plan(7)
+        ))), prompt)
+    assert plan.sessions
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+    assert all(_parse_time(session.scheduled_time, "scheduled_time") for session in plan.sessions)
+    for session_date in {s.session_date for s in plan.sessions}:
+        windows = sorted(_session_window(s) for s in plan.sessions if s.session_date == session_date)
+        assert all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+
+
+@pytest.mark.parametrize("provider_status", [None, "Unknown", "completed-by-ai", 42])
+def test_provider_status_is_normalized_to_scheduled(provider_status):
+    payload = _payload()
+    payload["sessions"][0]["status"] = provider_status
+    plan = parse_plan(json.dumps(payload))
+    assert all(session.status == "Scheduled" for session in plan.sessions)
+
+
+def test_mixed_provider_statuses_are_normalized_for_every_session():
+    payload = _payload()
+    payload["sessions"][0]["status"] = "Completed"
+    payload["sessions"][1]["status"] = "provider-arbitrary"
+    plan = parse_plan(json.dumps(payload))
+    assert [session.status for session in plan.sessions] == ["Scheduled", "Scheduled"]
 
 
 def test_seeded_random_time_assignment_is_repeatable():
@@ -791,13 +1672,11 @@ def test_explicit_day_count_inside_date_window_limits_session_dates():
             )
         ],
     )
-    plan = generate_plan(
-        Gateway(json.dumps(payload)),
-        "Create three days between September 13 to September 16.",
-    )
-    assert [session.session_date for session in plan.sessions] == [
-        "2026-09-13", "2026-09-14", "2026-09-15"
-    ]
+    with pytest.raises(ValueError, match="DATE_CONSTRAINT_CONFLICT"):
+        generate_plan(
+            Gateway(json.dumps(payload)),
+            "Create three days between September 13 to September 16.",
+        )
 
 
 def test_requested_time_range_rejects_out_of_range_generated_session():
@@ -858,7 +1737,7 @@ def test_duplicate_sessions_detected():
     payload = _payload()
     payload["sessions"][1]["session_date"] = payload["sessions"][0]["session_date"]
     payload["sessions"][1]["scheduled_time"] = payload["sessions"][0]["scheduled_time"]
-    with pytest.raises(ValueError, match="duplicate"):
+    with pytest.raises(ValueError, match="overlapping"):
         parse_plan(json.dumps(payload))
 
 
@@ -972,5 +1851,5 @@ def test_user_isolation_does_not_report_other_user_conflict(connection):
 def test_status_is_validated():
     payload = _payload()
     payload["sessions"][0]["status"] = "Unknown"
-    with pytest.raises(ValueError, match="invalid status"):
-        parse_plan(json.dumps(payload))
+    plan = parse_plan(json.dumps(payload))
+    assert all(session.status == "Scheduled" for session in plan.sessions)

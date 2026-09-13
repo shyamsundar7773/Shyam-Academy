@@ -6,6 +6,8 @@ from auth.session import require_current_user
 
 from database.connection import get_connection
 from services.module_service import get_modules
+from utils.module_context import get_active_module_id, set_active_module_id
+from utils.notes_presentation import group_notes_by_date
 
 connection = get_connection()
 user_id = require_current_user().user_id
@@ -17,6 +19,29 @@ st.caption("Your saved learning history, organized by date, category, and module
 if not modules:
     st.info("No modules available yet. Open a classroom to create notes.")
     st.stop()
+
+active_module_id = get_active_module_id(st.session_state, user_id, modules)
+module_ids = [module["module_id"] for module in modules]
+if st.session_state.get("notes_module_selector") != active_module_id:
+    st.session_state.notes_module_selector = active_module_id
+selected_module = st.selectbox(
+    "Module",
+    module_ids,
+    index=module_ids.index(active_module_id),
+    format_func=lambda module_id: next(
+        module["module_name"] for module in modules
+        if module["module_id"] == module_id
+    ),
+    key="notes_module_selector",
+)
+selected_module = next(
+    module for module in modules
+    if module["module_id"] == selected_module
+)
+set_active_module_id(st.session_state, user_id, selected_module["module_id"], modules)
+if st.session_state.get("notes_rendered_module_id") != selected_module["module_id"]:
+    st.session_state.pop("notes_cell_selection", None)
+    st.session_state.notes_rendered_module_id = selected_module["module_id"]
 
 note_categories = (
     "Today Learning", "Level 1", "Level 2", "Problem Solving",
@@ -30,17 +55,14 @@ notes = [
            FROM learning_notes n
            JOIN modules m ON m.module_id=n.module_id
            LEFT JOIN sessions s ON s.session_id=n.session_id
-           WHERE n.user_id=?
+           WHERE n.user_id=? AND n.module_id=?
            ORDER BY COALESCE(s.session_date, substr(n.saved_at, 1, 10)),
-                    n.category, m.module_name, n.learning_number""",
-        (user_id,),
+                    n.category, n.learning_number""",
+        (user_id, selected_module["module_id"]),
     ).fetchall()
 ]
 
 for note in notes:
-    note["category"] = {
-        "On-time Test": "Test", "Daily Test": "Test", "Weekly Test": "Test",
-    }.get(note["category"], note["category"])
     if note["session_date"]:
         note["note_date"] = note["session_date"]
     else:
@@ -49,26 +71,13 @@ for note in notes:
             ZoneInfo("Asia/Kolkata")
         ).date().isoformat()
 
-days = {}
-for note in notes:
-    day_entry = days.setdefault(
-        note["note_date"], {"day_number": note["day_number"], "notes": []}
-    )
-    if day_entry["day_number"] is None and note["day_number"] is not None:
-        day_entry["day_number"] = note["day_number"]
-    day_entry["notes"].append(note)
-
-if not days:
+grouped_notes = group_notes_by_date(notes)
+if not grouped_notes:
     st.info("No learning notes saved yet. Use Save Notes in a classroom to build this library.")
 
-for matrix_row, (note_date, day_entry) in enumerate(
-    sorted(days.items(), key=lambda item: item[0])
-):
-    day_number = day_entry["day_number"]
-    day_notes = day_entry["notes"]
+for matrix_row, (day_number, note_date, day_notes) in enumerate(grouped_notes):
     with st.container(border=True):
-        if day_number:
-            st.markdown(f"### Day {day_number}")
+        st.markdown(f"### Day {day_number}")
         st.caption(f"Date: {note_date}")
         columns = st.columns(len(note_categories) + 1, gap="small")
         columns[0].markdown("**Date**")
@@ -77,7 +86,7 @@ for matrix_row, (note_date, day_entry) in enumerate(
             category_notes = [
                 note for note in day_notes if note["category"] == category_name
             ]
-            module_ids = sorted({int(note["module_id"]) for note in category_notes})
+            module_ids = [selected_module["module_id"]] if category_notes else []
             label = f"{len(module_ids)} Module" if len(module_ids) == 1 else f"{len(module_ids)} Modules"
             columns[index].markdown(f"**{category_name}**")
             if columns[index].button(
@@ -91,3 +100,9 @@ for matrix_row, (note_date, day_entry) in enumerate(
                     "module_ids": module_ids,
                 }
                 st.switch_page("pages/full_notes.py")
+            times = sorted({
+                note["scheduled_time"] for note in category_notes
+                if note["scheduled_time"]
+            })
+            if times:
+                columns[index].caption(" · ".join(times))

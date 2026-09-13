@@ -13,6 +13,7 @@ from services.learning_service import (
 )
 from services.notes_service import get_user_note
 from services.module_service import get_modules
+from utils.module_context import get_active_module_id
 from utils.formatting import display_date
 from services.schedule_status import session_status
 
@@ -21,10 +22,7 @@ def _select_today_session(connection, user_id: str) -> int | None:
     modules = get_modules(connection, user_id)
     if not modules:
         return None
-    active_module_id = st.session_state.get("active_module_id", modules[0]["module_id"])
-    module_ids = {module["module_id"] for module in modules}
-    if active_module_id not in module_ids:
-        active_module_id = modules[0]["module_id"]
+    active_module_id = get_active_module_id(st.session_state, user_id, modules)
     sessions = [
         row for row in list_sessions(connection, active_module_id, user_id)
         if row["category"] == "Today Learning"

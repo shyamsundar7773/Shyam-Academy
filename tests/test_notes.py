@@ -260,3 +260,64 @@ def test_notes_cell_selection_groups_exact_modules_and_has_no_zero_fallback(conn
     )
     assert {note["module_id"] for note in selected} == {module_a, module_b}
     assert find_notes_for_cell(connection, "user-a", today, "Doubts", []) == []
+
+
+def test_notes_for_selected_module_rebuilds_dates_categories_and_timings(connection):
+    python_id = add_module(connection, "Python Basics", "Python", "user-a")
+    biology_id = add_module(connection, "Biology Basic", "Biology", "user-a")
+    for module_id, dates, time_prefix in (
+        (python_id, ("2026-09-13", "2026-09-14", "2026-09-15"), 7),
+        (biology_id, ("2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"), 10),
+    ):
+        for day_number, session_date in enumerate(dates, start=1):
+            connection.execute(
+                """
+                INSERT INTO sessions
+                    (module_id, day_number, session_date, category, topic,
+                     scheduled_time, prompt, status, owner_user_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, 'Level 1', ?, ?, 'prompt', 'Scheduled',
+                        'user-a', 'now', 'now')
+                """,
+                (
+                    module_id,
+                    day_number,
+                    session_date,
+                    f"Topic {session_date}",
+                    f"{time_prefix}:00 AM",
+                ),
+            )
+            session_id = connection.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
+            save_note(
+                connection, "user-a", module_id, session_id, "Level 1",
+                f"Topic {session_date}", f"Notes {session_date}", "content",
+            )
+    connection.commit()
+
+    def selected_module_notes(module_id):
+        rows = connection.execute(
+            """
+            SELECT n.module_id, n.category, s.session_date, s.scheduled_time
+            FROM learning_notes n
+            JOIN sessions s ON s.session_id = n.session_id
+            WHERE n.user_id = ? AND n.module_id = ?
+            ORDER BY s.session_date
+            """,
+            ("user-a", module_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    python = selected_module_notes(python_id)
+    biology = selected_module_notes(biology_id)
+    assert [row["session_date"] for row in python] == [
+        "2026-09-13", "2026-09-14", "2026-09-15"
+    ]
+    assert [row["session_date"] for row in biology] == [
+        "2026-09-13", "2026-09-14", "2026-09-15", "2026-09-16"
+    ]
+    assert {row["module_id"] for row in biology} == {biology_id}
+    assert [row["scheduled_time"] for row in biology] == [
+        "10:00 AM", "10:00 AM", "10:00 AM", "10:00 AM"
+    ]

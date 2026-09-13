@@ -1,6 +1,3 @@
-from collections import defaultdict
-
-
 import streamlit as st
 from auth.session import require_current_user
 
@@ -12,6 +9,8 @@ from services.attendance_service import (
 from services.module_service import get_modules
 from services.timetable_service import CATEGORIES, get_timetable, seed_development_timetable
 from utils.formatting import display_date
+from utils.module_context import get_active_module_id, set_active_module_id
+from utils.timetable_presentation import group_sessions_by_date
 
 connection = get_connection()
 user_id = require_current_user().user_id
@@ -32,9 +31,7 @@ def render_attendance():
         return
 
     module_ids = [module["module_id"] for module in modules]
-    active_module_id = st.session_state.get("active_module_id", module_ids[0])
-    if active_module_id not in module_ids:
-        active_module_id = module_ids[0]
+    active_module_id = get_active_module_id(st.session_state, user_id, modules)
     selected_module = st.selectbox(
         "Module",
         modules,
@@ -42,7 +39,7 @@ def render_attendance():
         format_func=lambda module: module["module_name"],
         key="attendance_module_selector",
     )
-    st.session_state.active_module_id = selected_module["module_id"]
+    set_active_module_id(st.session_state, user_id, selected_module["module_id"], modules)
 
     summary = attendance_summary(connection, user_id, selected_module["module_id"])
     metric_columns = st.columns(5)
@@ -53,12 +50,10 @@ def render_attendance():
     metric_columns[4].metric("Attendance", f"{summary['percentage']}%")
 
     sessions = get_timetable(connection, selected_module["module_id"], user_id)
-    grouped = defaultdict(list)
-    for session in sessions:
-        grouped[(session["day_number"], session["session_date"])].append(session)
+    grouped = group_sessions_by_date(sessions, CATEGORIES)
 
     st.caption("Green = Attended · Blue = Active · Gray = Upcoming/Past · Red = Missed")
-    for (day_number, session_date), day_sessions in grouped.items():
+    for day_number, session_date, day_sessions in grouped:
         with st.container(border=True):
             st.markdown(f"### Day {day_number}")
             st.caption(f"Date: {display_date(session_date)}")

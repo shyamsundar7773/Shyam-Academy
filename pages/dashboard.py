@@ -6,6 +6,7 @@ from services.module_service import get_modules
 from services.timetable_service import get_timetable, seed_development_timetable
 from services.schedule_status import can_start_learning, session_status
 from alarms.repository import get_alarm_for_session
+from utils.module_context import get_active_module_id
 from datetime import datetime
 
 connection = get_connection()
@@ -22,16 +23,19 @@ st.caption(datetime.now().strftime("%A, %d %B %Y · %I:%M %p"))
 if modules:
     today = datetime.now().date().isoformat()
     today_sessions = []
-    for module in modules:
-        for session in get_timetable(connection, module["module_id"], user_id):
-            if session["session_date"] == today:
-                session = dict(session)
-                session["module_name"] = module["module_name"]
-                session["display_status"] = session_status(session)
-                session["alarm"] = get_alarm_for_session(
-                    connection, user_id, session["session_id"]
-                )
-                today_sessions.append(session)
+    active_module_id = get_active_module_id(st.session_state, user_id, modules)
+    active_module = next(
+        module for module in modules if module["module_id"] == active_module_id
+    )
+    for session in get_timetable(connection, active_module_id, user_id):
+        if session["session_date"] == today:
+            session = dict(session)
+            session["module_name"] = active_module["module_name"]
+            session["display_status"] = session_status(session)
+            session["alarm"] = get_alarm_for_session(
+                connection, user_id, session["session_id"]
+            )
+            today_sessions.append(session)
     today_sessions.sort(key=lambda row: row["scheduled_time"])
     if not today_sessions:
         st.info("No learning sessions are scheduled for today.")
