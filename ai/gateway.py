@@ -120,11 +120,9 @@ class UnconfiguredGateway(AIGateway):
 
 
 def get_gateway() -> AIGateway:
-    import os
     from ai.providers.mock_provider import MockProvider
-    from config.bootstrap import load_environment
-    load_environment()
-    provider = os.getenv("SHYAM_ACADEMY_AI_PROVIDER", "mock").strip().lower()
+    from config.bootstrap import get_config_value
+    provider = (get_config_value("SHYAM_ACADEMY_AI_PROVIDER", "mock") or "").strip().lower()
 
     if provider in {"mock", "development"}:
         return MockProvider()

@@ -358,6 +358,7 @@ def test_firebase_missing_configuration(monkeypatch):
 
 def test_provider_configuration_defaults(monkeypatch):
     monkeypatch.delenv("SHYAM_ACADEMY_AI_API_KEY", raising=False)
+    monkeypatch.setattr("config.bootstrap._dotenv_configuration", lambda: {})
     config = get_provider_configuration()
     assert config.provider == "mock"
     assert not config.credential_configured

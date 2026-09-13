@@ -1,8 +1,7 @@
-import os
 from dataclasses import dataclass
 
 from auth.firebase import mask_secret
-from config.bootstrap import load_environment
+from config.bootstrap import get_config_value
 
 
 @dataclass(frozen=True)
@@ -15,14 +14,15 @@ class ProviderConfiguration:
 
 
 def get_provider_configuration() -> ProviderConfiguration:
-    load_environment()
-    provider = os.getenv("SHYAM_ACADEMY_AI_PROVIDER", "mock").strip().lower()
-    model = os.getenv("SHYAM_ACADEMY_AI_MODEL", "development-classroom")
-    account = os.getenv("SHYAM_ACADEMY_AI_ACCOUNT_REFERENCE")
-    credential = os.getenv("SHYAM_ACADEMY_AI_API_KEY")
+    provider = (get_config_value("SHYAM_ACADEMY_AI_PROVIDER", "mock") or "").strip().lower()
+    model = get_config_value("SHYAM_ACADEMY_AI_MODEL", "development-classroom") or ""
+    account = get_config_value("SHYAM_ACADEMY_AI_ACCOUNT_REFERENCE")
+    credential = get_config_value("SHYAM_ACADEMY_AI_API_KEY")
     return ProviderConfiguration(
         provider, model, account, bool(credential),
-        os.getenv("SHYAM_ACADEMY_AI_BASE_URL", "https://api.openai.com/v1"),
+        get_config_value(
+            "SHYAM_ACADEMY_AI_BASE_URL", "https://api.openai.com/v1"
+        ) or "",
     )
 
 
@@ -38,4 +38,4 @@ def provider_status() -> str:
 
 
 def masked_credential() -> str:
-    return mask_secret(os.getenv("SHYAM_ACADEMY_AI_API_KEY"))
+    return mask_secret(get_config_value("SHYAM_ACADEMY_AI_API_KEY"))

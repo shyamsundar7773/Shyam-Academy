@@ -2,7 +2,6 @@ import json
 import logging
 import socket
 import time
-import os
 from urllib import error, request
 from urllib.parse import urlparse
 
@@ -41,12 +40,23 @@ class CloudflareProvider(AIGateway):
     """Cloudflare Workers AI OpenAI-compatible chat-completions adapter."""
 
     def __init__(self, api_key=None, model=None, base_url=None, account_id=None, timeout=60):
-        from config.bootstrap import load_environment
-        load_environment()
-        self.api_key = os.getenv("SHYAM_ACADEMY_AI_API_KEY") if api_key is None else api_key
-        self.model = os.getenv("SHYAM_ACADEMY_AI_MODEL") if model is None else model
-        self.account_id = os.getenv("SHYAM_ACADEMY_AI_ACCOUNT_REFERENCE") if account_id is None else account_id
-        self.base_url = os.getenv("SHYAM_ACADEMY_AI_BASE_URL") if base_url is None else base_url
+        from config.bootstrap import get_config_value
+        self.api_key = (
+            get_config_value("SHYAM_ACADEMY_AI_API_KEY")
+            if api_key is None else api_key
+        )
+        self.model = (
+            get_config_value("SHYAM_ACADEMY_AI_MODEL")
+            if model is None else model
+        )
+        self.account_id = (
+            get_config_value("SHYAM_ACADEMY_AI_ACCOUNT_REFERENCE")
+            if account_id is None else account_id
+        )
+        self.base_url = (
+            get_config_value("SHYAM_ACADEMY_AI_BASE_URL")
+            if base_url is None else base_url
+        )
         self.timeout = timeout
         if not self.api_key:
             raise CloudflareProviderError("Cloudflare API token is not configured.")
