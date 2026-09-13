@@ -10,6 +10,7 @@ from database.connection import get_connection
 from services.module_service import get_modules
 from services.timetable_creator_service import (
     detect_conflicts,
+    apply_request_constraints,
     generate_plan,
     parse_plan,
     persist_plan,
@@ -142,7 +143,10 @@ if action_columns[2].button("Create timetable", type="primary", icon=":material/
         raw_plan["sessions"] = [
             session for index, session in enumerate(edited) if index not in removed
         ]
-        updated_plan = parse_plan(json.dumps(raw_plan))
+        updated_plan = apply_request_constraints(
+            parse_plan(json.dumps(raw_plan)),
+            st.session_state.get("ai_timetable_submitted_request", ""),
+        )
         module_id = st.session_state.get("ai_timetable_module_id")
         conflicts = detect_conflicts(connection, user_id, updated_plan, module_id)
         if conflicts:

@@ -1,7 +1,10 @@
 import json
 import re
 import sqlite3
+import random
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from ai.gateway import AIGateway, AIProviderError
 from database.repositories.module_repository import get_owned_module
@@ -11,8 +14,122 @@ from services.timetable_service import CATEGORIES, TIME_PATTERN
 VALID_STATUSES = {"Scheduled", "Completed", "Skipped"}
 _TIME_FORMAT = "%I:%M %p"
 _MONTH_PATTERN = (
-    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
 )
+_MONTHS = {
+    name.casefold(): index
+    for index, name in enumerate(
+        ("January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"),
+        start=1,
+    )
+}
+_MONTHS.update({
+    alias.casefold(): index
+    for alias, index in (
+        ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("jun", 6),
+        ("jul", 7), ("aug", 8), ("sep", 9), ("sept", 9), ("oct", 10),
+        ("nov", 11), ("dec", 12),
+    )
+})
+
+
+@dataclass(frozen=True)
+class TimetableSpec:
+    domain: str | None
+    topic_list: tuple[str, ...]
+    start_date: date | None
+    end_date: date | None
+    exact_date: date | None
+    explicit_dates: tuple[date, ...]
+    requested_duration_days: int | None
+    requested_session_count: int | None
+    sessions_per_day: int | None
+    allowed_categories: tuple[str, ...]
+    required_categories: tuple[str, ...]
+    excluded_categories: tuple[str, ...]
+    random_time_requested: bool
+    upcoming_time_requested: bool
+    time_start_minutes: int | None
+    time_end_minutes: int | None
+    timezone: str
+    daily_coverage: bool
+
+    @property
+    def allowed_dates(self) -> tuple[date, ...]:
+        if self.explicit_dates:
+            return self.explicit_dates
+        if self.exact_date:
+            return (self.exact_date,)
+        if self.start_date and self.end_date:
+            return tuple(
+                self.start_date + timedelta(days=offset)
+                for offset in range((self.end_date - self.start_date).days + 1)
+            )
+        return ()
+
+
+@dataclass(frozen=True)
+class ConstraintResult:
+    valid: bool
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CurriculumTopic:
+    topic_id: str
+    original_text: str
+    normalized_text: str
+    classification: str
+    suggested_category: str
+
+
+def _normalize_topic_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip(" \t\r\n-•*"))
+
+
+def extract_curriculum_topics(request: str) -> tuple[CurriculumTopic, ...]:
+    """Extract and deduplicate explicit curriculum items without trusting the AI."""
+    match = re.search(r"\[([^\]]+)\]", request, re.DOTALL)
+    if match:
+        candidates = re.split(r",|\n|;", match.group(1))
+    else:
+        marker = re.search(
+            r"(?:topics?|curriculum)\s*:\s*(.*)", request, re.IGNORECASE | re.DOTALL
+        )
+        candidates = (
+            re.split(r"\n", marker.group(1))
+            if marker
+            else []
+        )
+    topics: list[CurriculumTopic] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _normalize_topic_text(candidate)
+        normalized = re.sub(r"^\d+[\.)]\s*", "", normalized)
+        if len(normalized) < 2 or normalized.casefold() in seen:
+            continue
+        seen.add(normalized.casefold())
+        lowered = normalized.casefold()
+        if re.search(r"\b(interview|mock interview)\b", lowered):
+            category = "Interview Room" if "mock" in lowered else "Interview Preparation"
+        elif re.search(r"\b(test|assessment|quiz)\b", lowered):
+            category = "Test"
+        elif re.search(r"\b(problem|challenge|practice|exercise)\b", lowered):
+            category = "Problem Solving"
+        elif re.search(r"\b(advanced|optimization|performance|window|cte|index|transaction)\b", lowered):
+            category = "Level 2"
+        else:
+            category = "Level 1"
+        topics.append(CurriculumTopic(
+            topic_id=f"topic-{len(topics) + 1}",
+            original_text=normalized,
+            normalized_text=normalized.casefold(),
+            classification=category,
+            suggested_category=category,
+        ))
+    return tuple(topics)
 
 
 def _required_string(value, field: str) -> str:
@@ -37,7 +154,7 @@ def _parse_time(value, field: str, allow_empty: bool = False) -> str | None:
     if re.fullmatch(r"\d{1,2}\s*[AP]M", normalized):
         normalized = re.sub(r"(?i)(\d{1,2})\s*([AP]M)", r"\1:00 \2", normalized)
     elif re.fullmatch(r"\d{1,2}:\d{2}\s*[AP]M", normalized):
-        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = re.sub(r"(?i)\s*([AP]M)$", r" \1", normalized)
     elif re.fullmatch(r"\d{1,2}:\d{2}", normalized):
         try:
             return datetime.strptime(normalized, "%H:%M").strftime(_TIME_FORMAT).lstrip("0")
@@ -74,7 +191,12 @@ def _normalize_category(value: str) -> str:
     raise ValueError("The timetable contains an invalid learning category.")
 
 
-def _request_constraints(request: str) -> tuple[int | None, date | None, date | None, int | None, int | None]:
+def _parse_requested_date(month: str, day: str, year: str | None) -> date:
+    parsed_year = int(year or date.today().year)
+    return date(parsed_year, _MONTHS[month.casefold()], int(day))
+
+
+def _request_constraints(request: str) -> TimetableSpec:
     day_words = {
         "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
         "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -85,7 +207,7 @@ def _request_constraints(request: str) -> tuple[int | None, date | None, date | 
     days_match = re.search(
         r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
         r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
-        r"eighteen|nineteen|twenty)\s+days?\b",
+        r"eighteen|nineteen|twenty)\s*[- ]\s*days?\b",
         request,
         re.IGNORECASE,
     )
@@ -94,33 +216,62 @@ def _request_constraints(request: str) -> tuple[int | None, date | None, date | 
         if days_match and days_match.group(1).isdigit()
         else day_words.get(days_match.group(1).casefold()) if days_match else None
     )
-    date_match = re.search(
-        rf"\b{_MONTH_PATTERN}\s+(\d{{1,2}})(?:,?\s*(\d{{4}}))?"
-        rf"\s*(?:to|-)\s*"
-        rf"(?:(?:{_MONTH_PATTERN})\s+)?(\d{{1,2}})(?:,?\s*(\d{{4}}))?",
-        request,
-        re.IGNORECASE,
+    session_match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+sessions?\b"
+        r"(?!\s+(?:each|per)\s+day)",
+        request, re.IGNORECASE,
     )
-    start_date = end_date = None
-    if date_match:
-        month_names = re.findall(_MONTH_PATTERN, date_match.group(0), re.IGNORECASE)
-        start_year = int(date_match.group(2) or date.today().year)
-        end_year = int(date_match.group(4) or start_year)
+    requested_session_count = None
+    if session_match:
+        token = session_match.group(1).casefold()
+        requested_session_count = (
+            int(token) if token.isdigit() else day_words[token]
+        )
+    date_token = rf"({_MONTH_PATTERN})\s+(\d{{1,2}})(?:,?\s*(\d{{4}}))?"
+    range_match = re.search(
+        rf"\b(?:between\s+)?{date_token}\s*(?:to|through|and|-)\s*"
+        rf"(?:(?P<end_month>{_MONTH_PATTERN})\s+)?"
+        rf"(?P<end_day>\d{{1,2}})(?:,?\s*(?P<end_year>\d{{4}}))?",
+        request, re.IGNORECASE,
+    )
+    start_date = end_date = exact_date = None
+    explicit_dates: tuple[date, ...] = ()
+    if range_match:
         try:
-            start_date = date(
-                start_year,
-                datetime.strptime(month_names[0], "%B").month,
-                int(date_match.group(1)),
+            start_date = _parse_requested_date(
+                range_match.group(1), range_match.group(2), range_match.group(3)
             )
-            end_date = date(
-                end_year,
-                datetime.strptime(month_names[-1], "%B").month,
-                int(date_match.group(3)),
+            end_month = range_match.group("end_month") or range_match.group(1)
+            end_year = range_match.group("end_year") or range_match.group(3)
+            end_date = _parse_requested_date(
+                end_month, range_match.group("end_day"), end_year
             )
-            if end_date < start_date and not date_match.group(4):
+            if end_date < start_date and not range_match.group("end_year"):
                 end_date = end_date.replace(year=end_date.year + 1)
-        except (IndexError, ValueError):
+        except (KeyError, ValueError):
             start_date = end_date = None
+    else:
+        listed_dates = []
+        for match in re.finditer(date_token, request, re.IGNORECASE):
+            try:
+                listed_dates.append(
+                    _parse_requested_date(match.group(1), match.group(2), match.group(3))
+                )
+            except (KeyError, ValueError):
+                listed_dates = []
+                break
+        if len(listed_dates) > 1:
+            explicit_dates = tuple(dict.fromkeys(listed_dates))
+        single_match = re.search(
+            rf"\b{date_token}\b", request, re.IGNORECASE
+        )
+        if single_match and not explicit_dates:
+            try:
+                exact_date = _parse_requested_date(
+                    single_match.group(1), single_match.group(2), single_match.group(3)
+                )
+            except (KeyError, ValueError):
+                exact_date = None
 
     time_match = re.search(
         r"\b(?:between|from)\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?|[0-9]{1,2}:[0-9]{2})"
@@ -141,39 +292,367 @@ def _request_constraints(request: str) -> tuple[int | None, date | None, date | 
             ).minute
         except ValueError:
             start_minutes = end_minutes = None
-    return requested_days, start_date, end_date, start_minutes, end_minutes
+    starts_duration = bool(
+        re.search(r"\b(?:starting|beginning|commencing)\b", request, re.I)
+    )
+    if exact_date is not None and requested_days and starts_duration:
+        start_date, end_date, exact_date = (
+            exact_date,
+            exact_date + timedelta(days=requested_days - 1),
+            None,
+        )
+    elif exact_date is None and start_date and end_date and requested_days:
+        end_date = start_date + timedelta(days=requested_days - 1)
+    daily_coverage = bool(
+        re.search(r"\b(?:daily|each day|every day|one session each day|one per day)\b", request, re.I)
+    )
+    sessions_per_day_match = re.search(
+        r"\b(\d+|one|two|three|four|five)\s+sessions?\s+per\s+day\b",
+        request, re.I,
+    )
+    sessions_per_day = None
+    if sessions_per_day_match:
+        token = sessions_per_day_match.group(1).casefold()
+        sessions_per_day = int(token) if token.isdigit() else day_words[token]
+        daily_coverage = True
+    all_categories = bool(re.search(r"\ball categories?\b|\bevery category\b", request, re.I))
+    required_categories = tuple(CATEGORIES if all_categories else ())
+    random_time_requested = bool(re.search(r"\brandom\s+times?\b|\brandomly\s+timed\b", request, re.I))
+    upcoming_time_requested = bool(re.search(r"\bupcoming\b|\bin the future\b", request, re.I))
+    topic_list = tuple(topic.original_text for topic in extract_curriculum_topics(request))
+    if topic_list and requested_days and not (start_date or exact_date or explicit_dates):
+        start_date = date.today()
+        end_date = start_date + timedelta(days=requested_days - 1)
+    return TimetableSpec(
+        domain=None,
+        topic_list=topic_list,
+        start_date=start_date,
+        end_date=end_date,
+        exact_date=exact_date,
+        explicit_dates=explicit_dates,
+        requested_duration_days=requested_days,
+        requested_session_count=requested_session_count,
+        sessions_per_day=sessions_per_day or (1 if daily_coverage else None),
+        allowed_categories=tuple(CATEGORIES),
+        required_categories=required_categories,
+        excluded_categories=(),
+        random_time_requested=random_time_requested,
+        upcoming_time_requested=upcoming_time_requested,
+        time_start_minutes=start_minutes,
+        time_end_minutes=end_minutes,
+        timezone="Asia/Kolkata",
+        daily_coverage=daily_coverage,
+    )
 
 
 def _apply_request_constraints(
     plan: TimetablePlan, request: str
 ) -> TimetablePlan:
-    requested_days, window_start, window_end, time_start, time_end = _request_constraints(request)
-    sessions = plan.sessions
-    if window_start and window_end:
-        sessions = [
-            session for session in sessions
-            if window_start.isoformat() <= session.session_date <= window_end.isoformat()
-        ]
-    if requested_days is not None and window_start and window_end:
-        allowed_dates = sorted({session.session_date for session in sessions})[:requested_days]
-        sessions = [session for session in sessions if session.session_date in allowed_dates]
-        if len(allowed_dates) != requested_days:
-            raise ValueError(
-                "The AI timetable did not produce the requested number of dates "
-                "inside the requested date range."
-            )
-    if time_start is not None and time_end is not None:
+    spec = _request_constraints(request)
+    sessions = list(plan.sessions)
+    allowed_dates = spec.allowed_dates
+    if spec.exact_date:
+        sessions = [_replace_session_date(session, spec.exact_date) for session in sessions]
+        if spec.required_categories:
+            by_category = {
+                session.category: session
+                for session in reversed(sessions)
+                if session.category in spec.required_categories
+            }
+            if set(by_category) == set(spec.required_categories):
+                sessions = [
+                    by_category[category] for category in spec.required_categories
+                ]
+        if spec.sessions_per_day:
+            if len(sessions) < spec.sessions_per_day:
+                raise ValueError("SESSION_COUNT_MISMATCH")
+            sessions = sessions[:spec.sessions_per_day]
+    elif allowed_dates:
+        allowed_values = {item.isoformat() for item in allowed_dates}
+        outside = [session for session in sessions if session.session_date not in allowed_values]
+        if outside:
+            if spec.requested_duration_days:
+                sessions = [
+                    session for session in sessions
+                    if session.session_date in allowed_values
+                ]
+            else:
+                sessions = [
+                    _replace_session_date(
+                        session, allowed_dates[index % len(allowed_dates)]
+                    )
+                    for index, session in enumerate(sessions)
+                ]
+        if spec.daily_coverage or spec.requested_duration_days:
+            missing = {
+                item.isoformat() for item in allowed_dates
+            } - {session.session_date for session in sessions}
+            if missing:
+                raise ValueError("DATE_COVERAGE_MISMATCH")
+        if spec.sessions_per_day:
+            selected: list[PlannedSession] = []
+            for allowed_date in allowed_dates:
+                day_sessions = [
+                    session for session in sessions
+                    if session.session_date == allowed_date.isoformat()
+                ]
+                if len(day_sessions) < spec.sessions_per_day:
+                    raise ValueError("SESSION_COUNT_MISMATCH")
+                selected.extend(day_sessions[:spec.sessions_per_day])
+            sessions = selected
+    if spec.random_time_requested:
+        sessions = _assign_random_times(sessions, spec)
+    if spec.time_start_minutes is not None and spec.time_end_minutes is not None:
         def in_range(session: PlannedSession) -> bool:
             value = datetime.strptime(session.scheduled_time, _TIME_FORMAT)
             minutes = value.hour * 60 + value.minute
-            return time_start <= minutes <= time_end
+            return spec.time_start_minutes <= minutes <= spec.time_end_minutes
 
         if any(not in_range(session) for session in sessions):
             raise ValueError("A generated session falls outside the requested time range.")
-    return TimetablePlan(
-        plan.title, plan.module_name, plan.description, plan.start_date,
-        plan.end_date, plan.timezone, plan.assumptions, sessions,
+    if spec.required_categories:
+        missing = set(spec.required_categories) - {session.category for session in sessions}
+        if missing:
+            sessions = _add_missing_categories(sessions, missing, spec)
+            if spec.random_time_requested:
+                sessions = _assign_random_times(sessions, spec)
+    if (
+        spec.requested_session_count is not None
+        and len(sessions) != spec.requested_session_count
+    ):
+        raise ValueError("SESSION_COUNT_MISMATCH")
+    if allowed_dates:
+        start_date = allowed_dates[0].isoformat()
+        end_date = allowed_dates[-1].isoformat()
+    else:
+        start_date, end_date = plan.start_date, plan.end_date
+    result = TimetablePlan(
+        plan.title, plan.module_name, plan.description, start_date,
+        end_date, spec.timezone, plan.assumptions, _validate_sessions(
+            [vars(session) for session in sessions]
+        ),
     )
+    validation = validate_plan_constraints(result, spec)
+    if not validation.valid:
+        raise ValueError(validation.errors[0])
+    if any(
+        not (result.start_date <= session.session_date <= result.end_date)
+        for session in result.sessions
+    ):
+        raise ValueError("SESSION_DATE_OUTSIDE_REQUESTED_RANGE")
+    return result
+
+
+def apply_request_constraints(plan: TimetablePlan, request: str) -> TimetablePlan:
+    """Re-apply canonical hard constraints after preview edits."""
+    return _apply_request_constraints(plan, request)
+
+
+def validate_plan_constraints(
+    plan: TimetablePlan, spec: TimetableSpec | str
+) -> ConstraintResult:
+    """Validate hard user constraints without relying on model prose."""
+    requested = _request_constraints(spec) if isinstance(spec, str) else spec
+    errors: list[str] = []
+    allowed = {item.isoformat() for item in requested.allowed_dates}
+    dates = {session.session_date for session in plan.sessions}
+    if requested.exact_date and dates != {requested.exact_date.isoformat()}:
+        errors.append("EXACT_DATE_CONSTRAINT_VIOLATED")
+    elif allowed and any(item not in allowed for item in dates):
+        errors.append("SESSION_DATE_OUTSIDE_REQUESTED_RANGE")
+    if requested.daily_coverage or requested.requested_duration_days:
+        if not set(allowed).issubset(dates):
+            errors.append("DATE_COVERAGE_MISMATCH")
+    if requested.sessions_per_day and allowed:
+        for allowed_date in allowed:
+            if sum(
+                session.session_date == allowed_date
+                for session in plan.sessions
+            ) != requested.sessions_per_day:
+                errors.append("SESSION_COUNT_MISMATCH")
+                break
+    if requested.requested_session_count is not None and (
+        len(plan.sessions) != requested.requested_session_count
+    ):
+        errors.append("SESSION_COUNT_MISMATCH")
+    categories = {session.category for session in plan.sessions}
+    if requested.required_categories and not set(requested.required_categories).issubset(categories):
+        errors.append("REQUIRED_CATEGORY_MISSING")
+    if requested.time_start_minutes is not None and requested.time_end_minutes is not None:
+        for session in plan.sessions:
+            parsed = datetime.strptime(session.scheduled_time, _TIME_FORMAT)
+            minutes = parsed.hour * 60 + parsed.minute
+            if not requested.time_start_minutes <= minutes <= requested.time_end_minutes:
+                errors.append("TIME_WINDOW_VIOLATION")
+                break
+    if requested.topic_list:
+        searchable = " ".join(
+            f"{session.topic} {session.session_title} {session.prompt}"
+            for session in plan.sessions
+        ).casefold()
+        if any(topic.casefold() not in searchable for topic in requested.topic_list):
+            errors.append("TOPIC_NOT_COVERED")
+    return ConstraintResult(not errors, tuple(dict.fromkeys(errors)))
+
+
+def _curriculum_plan(request: str, spec: TimetableSpec) -> TimetablePlan:
+    topics = extract_curriculum_topics(request)
+    dates = spec.allowed_dates
+    if not topics or not dates:
+        raise ValueError("CURRICULUM_DISTRIBUTION_REQUIRES_TOPICS_AND_DATES")
+    session_count = max(len(dates), len(spec.required_categories))
+    topic_groups = [
+        topics[index * len(topics) // session_count:
+               (index + 1) * len(topics) // session_count]
+        for index in range(session_count)
+    ]
+    module_name = "SQL Developer" if re.search(r"\bsql\b", request, re.I) else "Learning Curriculum"
+    sessions = []
+    for index, group in enumerate(topic_groups):
+        target_date = dates[index % len(dates)]
+        category = (
+            spec.required_categories[index % len(spec.required_categories)]
+            if spec.required_categories
+            else group[0].suggested_category
+        )
+        topic_text = "; ".join(topic.original_text for topic in group)
+        scheduled_time = (
+            datetime.combine(date.today(), datetime.min.time())
+            + timedelta(hours=7 + (index % 12))
+        ).strftime(_TIME_FORMAT).lstrip("0")
+        sessions.append(PlannedSession(
+            target_date.isoformat(),
+            scheduled_time,
+            category,
+            topic_text,
+            f"{module_name}: {topic_text[:80]}",
+            f"Study {topic_text} with explanation, examples, and practice.",
+            None,
+            "Scheduled",
+            index + 1,
+        ))
+    plan = TimetablePlan(
+        title=f"{module_name} curriculum plan",
+        module_name=module_name,
+        description="Deterministically distributed curriculum plan.",
+        start_date=dates[0].isoformat(),
+        end_date=dates[-1].isoformat(),
+        timezone=spec.timezone,
+        assumptions=["Curriculum topics were distributed deterministically by the application."],
+        sessions=sessions,
+    )
+    return _apply_request_constraints(plan, request)
+
+
+def _has_curriculum_coverage(plan: TimetablePlan, topics: tuple[CurriculumTopic, ...]) -> bool:
+    searchable = " ".join(
+        f"{session.topic} {session.session_title} {session.prompt}"
+        for session in plan.sessions
+    ).casefold()
+    return bool(topics) and all(topic.normalized_text in searchable for topic in topics)
+
+
+def _replace_session_date(session: PlannedSession, target: date) -> PlannedSession:
+    return PlannedSession(
+        target.isoformat(), session.scheduled_time, session.category, session.topic,
+        session.session_title, session.prompt, session.scheduled_end_time,
+        session.status, session.day_number,
+    )
+
+
+def _assign_random_times(
+    sessions: list[PlannedSession], spec: TimetableSpec,
+    seed: int | None = None,
+) -> list[PlannedSession]:
+    low = spec.time_start_minutes if spec.time_start_minutes is not None else 7 * 60
+    high = spec.time_end_minutes if spec.time_end_minutes is not None else (
+        23 * 60 + 50 if spec.upcoming_time_requested else 21 * 60
+    )
+    if high < low:
+        raise ValueError("TIME_WINDOW_VIOLATION")
+    slot_minutes = 5 if spec.upcoming_time_requested else 15
+    default_duration = 5 if spec.upcoming_time_requested else 60
+    generator = random.Random(seed) if seed is not None else random.SystemRandom()
+    updated: dict[int, PlannedSession] = {}
+    for session_date in dict.fromkeys(session.session_date for session in sessions):
+        day_sessions = [
+            (index, session) for index, session in enumerate(sessions)
+            if session.session_date == session_date
+        ]
+        day_low = low
+        if spec.upcoming_time_requested:
+            local_now = datetime.now(ZoneInfo(spec.timezone))
+            if date.fromisoformat(session_date) == local_now.date():
+                next_minute = local_now.hour * 60 + local_now.minute + 1
+                day_low = max(day_low, ((next_minute + slot_minutes - 1) // slot_minutes) * slot_minutes)
+        candidates = list(range(day_low, high + 1, slot_minutes))
+        generator.shuffle(candidates)
+        occupied: list[tuple[int, int]] = []
+        for index, session in day_sessions:
+            duration = default_duration
+            if session.scheduled_end_time:
+                start = datetime.strptime(session.scheduled_time, _TIME_FORMAT)
+                end = datetime.strptime(session.scheduled_end_time, _TIME_FORMAT)
+                duration = int((end - start).total_seconds() // 60)
+                if duration <= 0:
+                    duration += 24 * 60
+            minute = next(
+                (
+                    candidate for candidate in candidates
+                    if all(
+                        candidate >= end or candidate + duration <= start
+                        for start, end in occupied
+                    )
+                ),
+                None,
+            )
+            if minute is None:
+                capacity = len(candidates)
+                raise ValueError(
+                    f"RANDOM_TIME_CAPACITY_EXCEEDED: {session_date} requires "
+                    f"{len(day_sessions)} sessions but only {capacity} valid start slots exist."
+                )
+            occupied.append((minute, minute + duration))
+            value = datetime.combine(date.today(), datetime.min.time()) + timedelta(minutes=minute)
+            end_value = value + timedelta(minutes=duration)
+            updated[index] = PlannedSession(
+                session.session_date, value.strftime(_TIME_FORMAT).lstrip("0"),
+                session.category, session.topic, session.session_title, session.prompt,
+                end_value.strftime(_TIME_FORMAT).lstrip("0"),
+                session.status, session.day_number,
+            )
+    return [updated[index] for index in range(len(sessions))]
+
+
+def _add_missing_categories(
+    sessions: list[PlannedSession], missing: set[str], spec: TimetableSpec
+) -> list[PlannedSession]:
+    dates = [item.isoformat() for item in spec.allowed_dates] or [sessions[0].session_date]
+    result = list(sessions)
+    next_index = len(result) + 1
+    used = {(session.session_date, session.scheduled_time) for session in result}
+    candidate_minutes = iter(range(7 * 60, 22 * 60, 60))
+    for category in sorted(missing, key=CATEGORIES.index):
+        target_date = dates[(next_index - 1) % len(dates)]
+        scheduled_time = None
+        for minute in candidate_minutes:
+            candidate = datetime.combine(
+                date.today(), datetime.min.time()
+            ) + timedelta(minutes=minute)
+            formatted = candidate.strftime(_TIME_FORMAT).lstrip("0")
+            if (target_date, formatted) not in used:
+                scheduled_time = formatted
+                used.add((target_date, formatted))
+                break
+        if scheduled_time is None:
+            raise ValueError("CATEGORY_TIME_CAPACITY_EXCEEDED")
+        result.append(PlannedSession(
+            target_date, scheduled_time, category, f"{category} practice",
+            f"{category} session", f"Teach {category} with examples and practice.",
+            None, "Scheduled", next_index,
+        ))
+        next_index += 1
+    return result
 
 
 def _session_window(session: PlannedSession) -> tuple[datetime, datetime]:
@@ -193,7 +672,9 @@ def _session_window(session: PlannedSession) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _validate_sessions(raw_sessions) -> list[PlannedSession]:
+def _validate_sessions(
+    raw_sessions, check_overlaps: bool = True
+) -> list[PlannedSession]:
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise ValueError("The timetable proposal must contain at least one session.")
     sessions = []
@@ -230,15 +711,16 @@ def _validate_sessions(raw_sessions) -> list[PlannedSession]:
         _session_window(session)
         sessions.append(session)
 
-    sessions.sort(key=lambda item: (item.session_date, item.scheduled_time))
-    for index, left in enumerate(sessions):
-        for right in sessions[index + 1:]:
-            if left.session_date != right.session_date:
-                break
-            left_start, left_end = _session_window(left)
-            right_start, right_end = _session_window(right)
-            if left_start < right_end and right_start < left_end:
-                raise ValueError("The timetable proposal contains overlapping sessions.")
+    if check_overlaps:
+        sessions.sort(key=lambda item: (item.session_date, item.scheduled_time))
+        for index, left in enumerate(sessions):
+            for right in sessions[index + 1:]:
+                if left.session_date != right.session_date:
+                    break
+                left_start, left_end = _session_window(left)
+                right_start, right_end = _session_window(right)
+                if left_start < right_end and right_start < left_end:
+                    raise ValueError("The timetable proposal contains overlapping sessions.")
     return sessions
 
 
@@ -250,7 +732,46 @@ def _validate_assumptions(value) -> list[str]:
     return [item.strip() for item in value if item.strip()]
 
 
-def parse_plan(response: str) -> TimetablePlan:
+def _normalize_plan_payload(raw: dict) -> dict:
+    """Normalize safe scalar/list representations before strict field validation."""
+    nested_plan = raw.get("plan")
+    normalized = (
+        {**raw, **nested_plan}
+        if isinstance(nested_plan, dict)
+        and ("sessions" not in raw or raw.get("sessions") is None)
+        else dict(raw)
+    )
+    if normalized.get("sessions") is None and isinstance(normalized.get("days"), list):
+        sessions = []
+        for day_index, day in enumerate(normalized["days"], start=1):
+            if not isinstance(day, dict):
+                raise ValueError("Plan field 'days' must contain session objects.")
+            day_sessions = day.get("sessions")
+            if day_sessions is None and "session_date" in day:
+                day_sessions = [day]
+            if not isinstance(day_sessions, list):
+                raise ValueError("Plan field 'days' must contain session lists.")
+            for session in day_sessions:
+                if not isinstance(session, dict):
+                    raise ValueError("Each planned session must be an object.")
+                normalized_session = dict(session)
+                if "session_date" not in normalized_session and day.get("date"):
+                    normalized_session["session_date"] = day["date"]
+                normalized_session.setdefault("day_number", day_index)
+                sessions.append(normalized_session)
+        normalized["sessions"] = sessions
+    assumptions = normalized.get("assumptions")
+    if isinstance(assumptions, str):
+        normalized["assumptions"] = [assumptions]
+    elif assumptions is None:
+        normalized["assumptions"] = []
+    return normalized
+
+
+def parse_plan(
+    response: str, check_overlaps: bool = True, enforce_plan_range: bool = True,
+    ignore_session_times: bool = False,
+) -> TimetablePlan:
     if not isinstance(response, str) or not response.strip():
         raise ValueError("The AI returned an empty timetable proposal.")
     candidate = response.strip()
@@ -267,12 +788,32 @@ def parse_plan(response: str) -> TimetablePlan:
         raise ValueError("The AI timetable response was not valid JSON.") from error
     if not isinstance(raw, dict):
         raise ValueError("The AI timetable response must be an object.")
-    sessions = _validate_sessions(raw.get("sessions"))
+    raw = _normalize_plan_payload(raw)
+    if ignore_session_times and isinstance(raw.get("sessions"), list):
+        placeholder_counts: dict[str, int] = {}
+        normalized_sessions = []
+        for session in raw["sessions"]:
+            if not isinstance(session, dict):
+                normalized_sessions.append(session)
+                continue
+            session_date = str(session.get("session_date", ""))
+            offset = placeholder_counts.get(session_date, 0)
+            placeholder_counts[session_date] = offset + 1
+            normalized_sessions.append({
+                **session,
+                "scheduled_time": (
+                    datetime.combine(date.today(), datetime.min.time())
+                    + timedelta(hours=7 + (offset % 12))
+                ).strftime(_TIME_FORMAT).lstrip("0"),
+                "scheduled_end_time": None,
+            })
+        raw["sessions"] = normalized_sessions
+    sessions = _validate_sessions(raw.get("sessions"), check_overlaps)
     start_date = _parse_date(raw.get("start_date"), "start_date")
     end_date = _parse_date(raw.get("end_date"), "end_date")
     if date.fromisoformat(end_date) < date.fromisoformat(start_date):
         raise ValueError("The timetable end date cannot be before its start date.")
-    if any(
+    if enforce_plan_range and any(
         not (start_date <= session.session_date <= end_date) for session in sessions
     ):
         raise ValueError("A session falls outside the plan date range.")
@@ -291,13 +832,55 @@ def parse_plan(response: str) -> TimetablePlan:
 def generate_plan(gateway: AIGateway, request: str) -> TimetablePlan:
     if not isinstance(request, str) or not request.strip():
         raise ValueError("Describe the timetable you want first.")
-    try:
-        response = gateway.generate_timetable(request.strip())
-    except AIProviderError:
-        raise
-    except Exception as error:
-        raise AIProviderError("The AI provider is currently unavailable.") from error
-    return _apply_request_constraints(parse_plan(response), request)
+    request = request.strip()
+    spec = _request_constraints(request)
+    curriculum_topics = extract_curriculum_topics(request)
+    curriculum_request = bool(
+        curriculum_topics
+        and spec.allowed_dates
+        and (
+            spec.requested_duration_days
+            or re.search(r"\b(?:fit|divide|distribute|every topic|all topics|curriculum)\b", request, re.I)
+        )
+    )
+    generation_request = request
+    last_error: ValueError | None = None
+    for attempt in range(2):
+        try:
+            response = gateway.generate_timetable(generation_request)
+        except AIProviderError as error:
+            last_error = ValueError(str(error))
+            if curriculum_request:
+                return _curriculum_plan(request, spec)
+            raise
+        except Exception as error:
+            raise AIProviderError("The AI provider is currently unavailable.") from error
+        try:
+            plan = _apply_request_constraints(
+                parse_plan(
+                    response,
+                    check_overlaps=False,
+                    enforce_plan_range=False,
+                    ignore_session_times=spec.random_time_requested,
+                ),
+                request,
+            )
+            if not curriculum_request or _has_curriculum_coverage(plan, curriculum_topics):
+                return plan
+            raise ValueError("TOPIC_NOT_COVERED")
+        except ValueError as error:
+            last_error = error
+            if curriculum_request:
+                return _curriculum_plan(request, spec)
+            if attempt == 0:
+                generation_request = (
+                    f"{request}\n\n"
+                    "Hard constraint validation failed. Regenerate a structured JSON "
+                    "timetable that obeys every date, time, category, count, and topic "
+                    f"constraint. Validation error: {error}"
+                )
+    assert last_error is not None
+    raise last_error
 
 
 def detect_conflicts(
