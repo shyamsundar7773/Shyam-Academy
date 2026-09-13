@@ -78,13 +78,47 @@ if theme_name == "dark":
 st.markdown(
     f"""
     <style>
-    html, body, [class*="css"] {{ font-size: 1.02rem; }}
-    h1, h2, h3 {{ font-weight: 700; letter-spacing: -0.015em; }}
+    html, body, [class*="css"] {{
+        font-size: 1.12rem;
+        font-weight: 500;
+        line-height: 1.5;
+    }}
+    h1 {{ font-size: clamp(2rem, 3.2vw, 2.8rem); font-weight: 750; letter-spacing: -0.015em; }}
+    h2 {{ font-size: clamp(1.55rem, 2.5vw, 2.15rem); font-weight: 700; letter-spacing: -0.012em; }}
+    h3 {{ font-size: clamp(1.3rem, 2vw, 1.7rem); font-weight: 700; letter-spacing: -0.01em; }}
+    h4, h5, h6 {{ font-weight: 650; }}
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCaptionContainer"],
+    [data-testid="stWidgetLabel"] {{
+        font-size: 1.04rem;
+        font-weight: 500;
+        line-height: 1.5;
+    }}
+    [data-testid="stButton"] button,
+    [data-testid="stFormSubmitButton"] button {{
+        min-height: 2.75rem;
+        padding: .55rem 1rem;
+        font-size: 1.02rem;
+        font-weight: 650;
+    }}
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stNumberInput"] input,
+    [data-baseweb="select"] {{
+        font-size: 1.04rem;
+        font-weight: 500;
+    }}
     [data-testid="stMarkdownContainer"] p, [data-testid="stCaptionContainer"] {{
         color: {theme_colors["text"]};
     }}
     [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{
-        font-weight: 600;
+        font-size: 1.05rem;
+        font-weight: 650;
+    }}
+    [data-testid="stSidebar"] [data-testid="stRadio"] label,
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] {{
+        font-size: 1.04rem;
+        font-weight: 550;
     }}
     [data-testid="stAppViewContainer"] {{
         {background_css}; color: {theme_colors["text"]};
@@ -125,7 +159,7 @@ st.markdown(
         border-color: {theme_colors["border"]};
     }}
     [data-testid="stPopoverButton"] {{
-        border-radius: 999px; min-width: 2.5rem; min-height: 2.5rem;
+        border-radius: 999px; min-width: 2.75rem; min-height: 2.75rem;
         font-weight: 700; background: {accent}; color: #ffffff;
         border: 1px solid {accent};
     }}

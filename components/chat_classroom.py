@@ -34,7 +34,9 @@ def render_classroom_styles(classroom_key: str) -> None:
             background: {surface};
             color: {text};
             overflow: hidden;
-            font-size: 1.02rem;
+            font-size: 1.12rem;
+            font-weight: 500;
+            line-height: 1.5;
         }}
         .st-key-{classroom_key} > div:first-child {{
             position: sticky;
@@ -52,8 +54,8 @@ def render_classroom_styles(classroom_key: str) -> None:
             border: 0;
             background: transparent;
             padding: 0;
-            font-size: 1.5rem;
-            font-weight: 700;
+            font-size: 1.7rem;
+            font-weight: 750;
             color: {text};
         }}
         .st-key-{classroom_key}_history {{
@@ -73,8 +75,9 @@ def render_classroom_styles(classroom_key: str) -> None:
             margin: .7rem 0;
             padding: .85rem 1rem;
             border-radius: .9rem;
-            line-height: 1.58;
-            font-size: 1.04rem;
+            line-height: 1.65;
+            font-size: 1.12rem;
+            font-weight: 500;
         }}
         .st-key-{classroom_key}_history [class*="classroom-user"] {{
             background: {"#24496d" if dark else "#e5f1ff"};
@@ -110,12 +113,12 @@ def render_classroom_styles(classroom_key: str) -> None:
             border-radius: 999px;
             background: {"#2f6fa3" if dark else "#b9d9f5"};
             color: {"#ffffff" if dark else "#12304f"};
-            font-size: .67rem;
+            font-size: .74rem;
             font-weight: 800;
         }}
         .st-key-{classroom_key}_history [class*="classroom-role"] {{
             font-weight: 700;
-            font-size: .92rem;
+            font-size: 1rem;
             margin-bottom: .2rem;
         }}
         .st-key-{classroom_key}_composer {{
@@ -153,14 +156,15 @@ def render_classroom_styles(classroom_key: str) -> None:
             background: {"#172235" if dark else "#ffffff"};
         }}
         .st-key-{classroom_key}_composer textarea {{
-            font-size: 1.02rem !important;
+            font-size: 1.12rem !important;
+            font-weight: 500 !important;
         }}
         .st-key-{classroom_key}_send button {{
             min-height: 3.25rem;
             width: 3.25rem;
             border-radius: 999px;
-            font-size: 1.35rem;
-            font-weight: 700;
+            font-size: 1.45rem;
+            font-weight: 750;
             background: #16b99a;
             border-color: #16b99a;
             color: #ffffff;
