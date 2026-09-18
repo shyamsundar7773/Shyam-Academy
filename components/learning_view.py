@@ -71,9 +71,6 @@ def render_learning_page(expected_category: str | None = None) -> None:
         st.warning(
             f"This session is upcoming and becomes available at {session['scheduled_time']}."
         )
-        if st.button("Back to session details", icon=":material/arrow_back:"):
-            st.session_state.selected_session_id = context.session_id
-            st.switch_page("pages/session_details.py")
         return
 
     if expected_category and session["category"] != expected_category:
@@ -91,17 +88,19 @@ def render_learning_page(expected_category: str | None = None) -> None:
         history_key, load_history(connection, context.user_id, str(context.session_id))
     )
 
-    st.caption(
-        f"Day {session['day_number']} · {display_date(session['session_date'])} · "
-        f"{session['category']} · {session['scheduled_time']}"
-    )
-    st.subheader(session["topic"])
-    st.text_area(
-        "Lesson prompt",
-        key=prompt_key,
-        height=120,
-        help="This prompt is sent to the configured AI provider for this session.",
-    )
+    if not st.session_state[lesson_key]:
+        st.caption(
+            f"Day {session['day_number']} · {display_date(session['session_date'])} · "
+            f"{session['category']} · {session['scheduled_time']}"
+        )
+        st.subheader(session["topic"])
+    with st.expander("Lesson prompt", expanded=False):
+        st.text_area(
+            "Lesson prompt",
+            key=prompt_key,
+            height=120,
+            help="This prompt is sent to the configured AI provider for this session.",
+        )
 
     if not st.session_state[lesson_key] and not st.session_state.get(f"{state_key}_attempted"):
         st.session_state[f"{state_key}_attempted"] = True
@@ -141,11 +140,6 @@ def render_learning_page(expected_category: str | None = None) -> None:
             get_gateway(),
             save_learning_notes,
         )
-        if st.button("Back to session details", icon=":material/arrow_back:"):
-            st.session_state.selected_session_id = context.session_id
-            st.switch_page("pages/session_details.py")
         return
 
-    if st.button("Back to session details", icon=":material/arrow_back:"):
-        st.session_state.selected_session_id = context.session_id
-        st.switch_page("pages/session_details.py")
+    return
