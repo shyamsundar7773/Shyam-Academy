@@ -179,3 +179,27 @@ def verify_id_token(id_token: str) -> dict:
     if not users or not users[0].get("localId"):
         raise FirebaseAuthError("Authentication token is invalid or expired.")
     return users[0]
+
+
+def refresh_id_token(refresh_token: str) -> dict:
+    config = get_firebase_configuration()
+    if not config.enabled or not refresh_token.strip():
+        raise FirebaseAuthError("Authentication session is invalid or expired.")
+    try:
+        with request.urlopen(
+            request.Request(
+                f"https://securetoken.googleapis.com/v1/token?key={config.web_api_key}",
+                data=urlencode({
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token.strip(),
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+            timeout=10,
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise FirebaseAuthError("Authentication session is invalid or expired.") from exc
+    if not result.get("id_token") or not result.get("user_id"):
+        raise FirebaseAuthError("Authentication session is invalid or expired.")
+    return result

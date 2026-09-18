@@ -18,5 +18,6 @@ def test_classroom_typography_is_increased_without_changing_layout_contract():
     assert "font-size: 1.12rem" in source
     assert "font-size: 1.7rem" in source
     assert "font-size: 1.12rem !important" in source
-    assert "overflow-y: auto" in source
+    assert 'key=f"{classroom_key}_history"' in source
+    assert "height=600" in source
     assert "position: absolute" in source

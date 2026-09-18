@@ -2,6 +2,7 @@ import base64
 import streamlit as st
 
 from auth.session import get_current_user, sign_out
+from auth.persistence import clear_persisted_refresh_token, persist_refresh_token
 from database.connection import get_connection
 from database.schema import initialize_database
 from pages.auth import render_auth_screen
@@ -18,6 +19,7 @@ st.set_page_config(
 connection = get_connection()
 initialize_database(connection)
 current_user = get_current_user()
+persist_refresh_token(st.session_state.get("firebase_refresh_token"))
 if current_user is None:
     render_auth_screen()
     st.stop()
@@ -300,6 +302,7 @@ with profile_column:
         st.caption(email or "Authenticated account")
         if st.button("Logout", use_container_width=True):
             sign_out()
-            st.rerun()
+            clear_persisted_refresh_token()
+            st.stop()
 
 page.run()

@@ -3,10 +3,12 @@ from uuid import uuid4
 
 from auth.firebase import (
     FirebaseAuthError,
+    refresh_id_token,
     sign_in_email_password,
     sign_in_google_id_token,
     verify_id_token,
 )
+from auth.persistence import get_persisted_refresh_token
 from models.academy import AcademyUser
 
 
@@ -21,6 +23,18 @@ def require_current_user() -> AcademyUser:
 
 def get_current_user() -> AcademyUser | None:
     token = st.session_state.get("firebase_id_token")
+    if not token:
+        refresh_token = get_persisted_refresh_token()
+        if refresh_token:
+            try:
+                refreshed = refresh_id_token(refresh_token)
+                token = refreshed["id_token"]
+                st.session_state.firebase_id_token = token
+                st.session_state.firebase_refresh_token = refreshed.get(
+                    "refresh_token", refresh_token
+                )
+            except FirebaseAuthError:
+                return None
     if not token:
         return None
     try:
@@ -42,6 +56,8 @@ def sign_in(email: str, password: str) -> AcademyUser:
     if not token or not uid:
         raise FirebaseAuthError("Firebase did not return a valid authenticated session.")
     st.session_state.firebase_id_token = token
+    if result.get("refreshToken"):
+        st.session_state.firebase_refresh_token = result["refreshToken"]
     st.session_state.firebase_email = result.get("email", email.strip())
     st.session_state.current_user = AcademyUser(uid)
     st.session_state.auth_session_id = uuid4().hex
@@ -54,6 +70,8 @@ def sign_in_google(result: dict) -> AcademyUser:
     if not token or not uid:
         raise FirebaseAuthError("Google authentication did not return a valid session.")
     st.session_state.firebase_id_token = token
+    if result.get("refreshToken"):
+        st.session_state.firebase_refresh_token = result["refreshToken"]
     st.session_state.firebase_email = result.get("email", "")
     st.session_state.current_user = AcademyUser(uid)
     st.session_state.auth_session_id = uuid4().hex
@@ -65,7 +83,7 @@ def sign_in_google(result: dict) -> AcademyUser:
 
 def sign_out() -> None:
     for key in (
-        "firebase_id_token", "firebase_email", "current_user",
+        "firebase_id_token", "firebase_refresh_token", "firebase_email", "current_user",
         "appearance_user_id", "academy_background", "academy_background_asset",
         "academy_theme", "academy_theme_toggle", "auth_session_id",
     ):

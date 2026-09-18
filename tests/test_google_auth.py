@@ -38,3 +38,32 @@ def test_google_id_token_payload_uses_firebase_idp(monkeypatch):
     assert result["localId"] == "google-user"
     assert "providerId=google.com" in captured["payload"]["postBody"]
     assert "google-id-token" in captured["payload"]["postBody"]
+
+
+def test_refresh_id_token_uses_firebase_secure_token_endpoint(monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"id_token":"new-id-token","user_id":"firebase-user","refresh_token":"rotated"}'
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["body"] = req.data.decode("utf-8")
+        return Response()
+
+    monkeypatch.setattr(firebase.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("SHYAM_ACADEMY_FIREBASE_PROJECT_ID", "project")
+    monkeypatch.setenv("SHYAM_ACADEMY_FIREBASE_WEB_API_KEY", "web-key")
+    result = firebase.refresh_id_token("browser-refresh-token")
+    assert result["user_id"] == "firebase-user"
+    assert captured["url"].startswith(
+        "https://securetoken.googleapis.com/v1/token?key=web-key"
+    )
+    assert "grant_type=refresh_token" in captured["body"]
